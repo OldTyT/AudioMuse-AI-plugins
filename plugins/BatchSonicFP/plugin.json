@@ -6,7 +6,7 @@
   "requirements": [],
   "versions": [
     {
-      "version": "0.0.8",
+      "version": "v0.0.8",
       "min_core_version": "2.5.0",
       "changelog": "Fix name playlist generations",
       "imageUrl": "",
