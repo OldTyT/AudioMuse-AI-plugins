@@ -575,14 +575,14 @@ def create_private_playlist(username, canonical_ids):
         if not navidrome_ids:
             logger.error(f"No valid provider IDs found to create playlist for user {username}.")
             return
-            
         playlist_name = get_s('playlist_name')
         base_url_full = get_s('navidrome_url').rstrip('/')
         extauth_header = get_s('extauth_header')
         headers = {extauth_header: username}
-        
+        playlist_name = f"[{username}] {playlist_name} - {date.today()}"
+
         # Subsonic createPlaylist requires an array of songId parameters
-        base_params = {'name': f"[{username}] {playlist_name} - {date.today()}"}
+        base_params = {'name': playlist_name}
         song_ids_param = [('songId', tid) for tid in navidrome_ids]
         
         query = urlencode(base_params)
