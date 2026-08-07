@@ -10,8 +10,8 @@
       "min_core_version": "2.5.0",
       "changelog": "Added rotations playlists",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/OldTyT/AudioMuse-AI-plugins/main/dist/batch_sonic_fp/batch_sonic_fp_0.0.7.zip",
+      "checksum": "cf6125fb1275fd79035b6cbbeeaa716e"
     },
     {
       "version": "0.0.6",
