@@ -1,0 +1,39 @@
+{
+  "plugins": [
+    {
+      "id": "batch_sonic_fp",
+      "name": "BatchSonicFP",
+      "author": "OldTyT",
+      "description": "Create playlist for every user.",
+      "pluginUrl": "https://raw.githubusercontent.com/OldTyT/AudioMuse-AI-plugins/main/plugins/BatchSonicFP/plugin.json"
+    },
+    {
+      "id": "song_counter",
+      "name": "SongCounter",
+      "author": "NeptuneHub",
+      "description": "Counts analyzed songs as a bar chart, and uses the on_song_analyzed worker hook to show a per-run count of songs analyzed plus the full hook payload of the last analyzed song.",
+      "pluginUrl": "https://raw.githubusercontent.com/NeptuneHub/AudioMuse-AI-plugins/main/plugins/SongCounter/plugin.json"
+    },
+    {
+      "id": "lumae_analysis",
+      "name": "Lumae Analysis",
+      "author": "Lumae",
+      "description": "Companion plugin for the Lumae music app, providing server-side features and AudioMuse-AI integration.",
+      "pluginUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/plugins/LumaeAnalysis/plugin.json"
+    },
+    {
+      "id": "spectrum_analyzer",
+      "name": "SpectrumAnalyzer",
+      "author": "T.N.Nguyen",
+      "description": "Spectrum analysis and fake-lossless detection with per-song spectrograms.",
+      "pluginUrl": "https://raw.githubusercontent.com/nguyentn1197/audiomuse-ai-spectrum-analyzer-plugin/main/plugins/SpectrumAnalyzer/plugin.json"
+    },
+    {
+      "id": "rocm_accelerator",
+      "name": "AMD GPU Hardware Acceleration",
+      "author": "Schaka",
+      "description": "Requires the AudioMuse-AI ROCm worker image; inert on other images. Runs musicnn and the CLAP audio encoder on the AMD GPU via ONNX Runtime's MIGraphX provider, and swaps lyrics ASR to a GPU-backed engine (faster-whisper/CTranslate2, whisper.cpp, or parakeet.cpp) instead of the built-in ONNX Whisper. Per-arch profiles handle generation differences (fp16, blocked backends, etc). Docs: https://github.com/Schaka/audiomuse-rocm-plugin/blob/main/plugin/rocm_accelerator/README.md",
+      "pluginUrl": "https://github.com/Schaka/audiomuse-rocm-plugin/releases/latest/download/plugin.json"
+    }
+  ]
+}
