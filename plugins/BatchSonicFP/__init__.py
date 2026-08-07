@@ -486,7 +486,7 @@ def create_private_playlist(username, canonical_ids):
         headers = {extauth_header: username}
         
         # Subsonic createPlaylist requires an array of songId parameters
-        base_params = {'name': playlist_name}
+        base_params = {'name': f"[{username}] {playlist_name} - {date.today()}"}
         song_ids_param = [('songId', tid) for tid in navidrome_ids]
         
         query = urlencode(base_params)
