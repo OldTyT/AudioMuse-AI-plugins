@@ -328,57 +328,77 @@ def create_private_playlist(username, canonical_ids):
         logger.exception(f"Failed to create/update playlist for {username}: {e}")
 
 def run_batch_task():
-    """Main entry point executed by the AudioMuse-AI Cron scheduler."""
-    logger.info("=== Starting Batch Sonic Fingerprint via ND_EXTAUTH ===")
-    users = get_all_users()
+    """Main entry point executed by the AudioMuse-AI Cron scheduler or RQ worker."""
     
-    if not users:
-        logger.warning("No users fetched. Aborting.")
-        return
+    # RQ workers operate outside the Flask application context.
+    # We must explicitly create it to access get_setting(), get_db(), etc.
+    try:
+        from flask_app import app
+        ctx = app.app_context()
+        ctx.push()
+    except Exception as e:
+        logger.error(f"Failed to push app context in RQ worker: {e}")
+        ctx = None
+
+    try:
+        logger.info("=== Starting Batch Sonic Fingerprint via ND_EXTAUTH ===")
+        users = get_all_users()
         
-    num_neighbors = get_s('num_neighbors')
-    max_tracks = get_s('max_tracks')
-    
-    for user in users:
-        try:
-            logger.info(f"Processing user: {user}")
-            top_tracks = get_user_top_tracks(user)
-            if not top_tracks:
-                logger.warning(f"No top tracks found for user {user}. Skipping.")
-                continue
-                
-            result = compute_fingerprint_vector(user, top_tracks)
-            if not result:
-                logger.warning(f"Could not compute fingerprint vector for user {user}. Skipping.")
-                continue
-                
-            average_vector, seed_ids = result
+        if not users:
+            logger.warning("No users fetched. Aborting.")
+            return
             
-            # Expand the seed pool using vector search
-            similar_tracks = get_similar_tracks(average_vector, num_neighbors)
-            similar_ids = [t['item_id'] for t in similar_tracks]
-            
-            # Combine seeds and neighbors, removing duplicates while preserving order
-            final_ids = []
-            seen = set()
-            for cid in seed_ids + similar_ids:
-                if cid not in seen:
-                    final_ids.append(cid)
-                    seen.add(cid)
+        num_neighbors = get_s('num_neighbors')
+        max_tracks = get_s('max_tracks')
+        
+        for user in users:
+            try:
+                logger.info(f"Processing user: {user}")
+                top_tracks = get_user_top_tracks(user)
+                if not top_tracks:
+                    logger.warning(f"No top tracks found for user {user}. Skipping.")
+                    continue
                     
-            # Truncate to the final desired size
-            final_ids = final_ids[:max_tracks]
-            
-            if not final_ids:
-                logger.warning(f"No final tracks generated for user {user}.")
-                continue
+                result = compute_fingerprint_vector(user, top_tracks)
+                if not result:
+                    logger.warning(f"Could not compute fingerprint vector for user {user}. Skipping.")
+                    continue
+                    
+                average_vector, seed_ids = result
                 
-            create_private_playlist(user, final_ids)
-            
-        except Exception as e:
-            logger.exception(f"Fatal error processing user {user}: {e}")
-            
-    logger.info("=== Batch Sonic Fingerprint completed ===")
+                # Expand the seed pool using vector search
+                similar_tracks = get_similar_tracks(average_vector, num_neighbors)
+                similar_ids = [t['item_id'] for t in similar_tracks]
+                
+                # Combine seeds and neighbors, removing duplicates while preserving order
+                final_ids = []
+                seen = set()
+                for cid in seed_ids + similar_ids:
+                    if cid not in seen:
+                        final_ids.append(cid)
+                        seen.add(cid)
+                        
+                # Truncate to the final desired size
+                final_ids = final_ids[:max_tracks]
+                
+                if not final_ids:
+                    logger.warning(f"No final tracks generated for user {user}.")
+                    continue
+                    
+                create_private_playlist(user, final_ids)
+                
+            except Exception as e:
+                logger.exception(f"Fatal error processing user {user}: {e}")
+                
+        logger.info("=== Batch Sonic Fingerprint completed ===")
+        
+    finally:
+        # Clean up the application context to prevent memory leaks in the worker
+        if ctx is not None:
+            try:
+                ctx.pop()
+            except Exception:
+                pass
 
 # --- UI ROUTES ---
 
@@ -432,6 +452,9 @@ def home():
 @bp.route('/run-now', methods=['POST'])
 def run_now():
     """Manually trigger the batch task outside of cron."""
+    result_message = ""
+    result_type = "success"
+    
     try:
         # Safely get Redis URL from Flask app config, fallback to Docker default
         redis_url = config.REDIS_URL
@@ -440,7 +463,7 @@ def run_now():
         # Use 'high' queue for critical/coordinator tasks
         q = Queue('high', connection=redis_conn)
         
-        # Pass the function object directly to avoid import path issues in RQ
+        # Pass the function object directly to RQ
         job = q.enqueue(run_batch_task, job_timeout='2h')
         
         # Initialize task status so it appears in the UI task panel immediately
@@ -449,13 +472,41 @@ def run_now():
             details={"message": "Manual batch run triggered by admin..."}
         )
         
-        flash(f"Task started successfully. Job ID: {job.id}", "success")
+        result_message = (
+            f"Task enqueued successfully.<br>"
+            f"<strong>Job ID:</strong> <code>{job.id}</code><br>"
+            f"Go to the main dashboard to monitor progress in the Tasks Panel."
+        )
+        
     except Exception as e:
-        flash(f"Failed to start task: {str(e)}", "error")
+        result_type = "error"
+        result_message = f"Failed to start task:<br><code>{str(e)}</code>"
         logger.exception("Error enqueuing manual run")
         
-    # Redirect back to home page or plugin home
-    return redirect(request.referrer or url_for('batch_sonic_fp.home'))
+    # Render a dedicated result page instead of relying on Flask's flash/session
+    alert_color = '#d4edda' if result_type == 'success' else '#f8d7da'
+    text_color = '#155724' if result_type == 'success' else '#721c24'
+    
+    body = f'''
+        <h3>Batch Sonic Fingerprint - Manual Trigger Result</h3>
+        <div style="padding: 1.5rem; margin: 1.5rem 0; border-radius: 4px; 
+                    background-color: {alert_color}; color: {text_color}; 
+                    border: 1px solid rgba(0,0,0,.1);">
+            <strong style="font-size: 1.1rem;">
+                {'✅ Success!' if result_type == 'success' else '❌ Error:'}
+            </strong><br><br>
+            {result_message}
+        </div>
+        
+        <div style="margin-top: 2rem;">
+            <a href="{url_for('batch_sonic_fp.home')}" class="btn btn-primary" 
+               style="padding: .5rem 1rem; background: #007bff; color: white; 
+                      text-decoration: none; border-radius: 4px;">
+                ← Back to Plugin Home
+            </a>
+        </div>
+    '''
+    return render_page(body, title='Task Trigger Result')
 
 @bp.route('/settings', methods=['GET', 'POST'])
 def settings():
