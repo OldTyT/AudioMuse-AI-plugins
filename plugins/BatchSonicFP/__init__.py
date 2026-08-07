@@ -555,63 +555,6 @@ def rotate_user_playlists(username, base_playlist_name, current_date_str):
     except Exception as e:
         logger.exception(f"Failed to rotate playlists for user {username}: {e}")
 
-def create_private_playlist(username, canonical_ids):
-    """Reverse maps canonical IDs to Navidrome IDs, creates the playlist, and hides it."""
-    server_id = get_server_id()
-    if not server_id: return
-    
-    db = get_db()
-    cur = db.cursor()
-    
-    try:
-        # FIXED: column is 'provider_track_id', not 'provider_id'
-        cur.execute(
-            "SELECT item_id, provider_track_id FROM track_server_map WHERE server_id = %s AND item_id = ANY(%s)",
-            (server_id, canonical_ids)
-        )
-        reverse_map = {row[0]: row[1] for row in cur.fetchall()}
-        
-        navidrome_ids = [reverse_map[cid] for cid in canonical_ids if cid in reverse_map]
-        if not navidrome_ids:
-            logger.error(f"No valid provider IDs found to create playlist for user {username}.")
-            return
-        playlist_name = get_s('playlist_name')
-        base_url_full = get_s('navidrome_url').rstrip('/')
-        extauth_header = get_s('extauth_header')
-        headers = {extauth_header: username}
-        playlist_name = f"[{username}] {playlist_name} - {date.today()}"
-
-        # Subsonic createPlaylist requires an array of songId parameters
-        base_params = {'name': playlist_name}
-        song_ids_param = [('songId', tid) for tid in navidrome_ids]
-        
-        query = urlencode(base_params)
-        song_query = urlencode(song_ids_param, doseq=True)
-        full_url = f"{base_url_full}/rest/createPlaylist.view?{query}&{song_query}&v=1.16.1&c=AudioMusePlugin&f=json"
-        
-        res = requests.get(full_url, headers=headers, timeout=15)
-        res.raise_for_status()
-        data = res.json()
-        
-        playlist_id = data.get('subsonic-response', {}).get('playlist', {}).get('id')
-        if not playlist_id:
-            logger.error(f"Failed to parse playlist ID from createPlaylist for user {username}")
-            return
-            
-        logger.info(f"Created playlist '{playlist_name}' (ID: {playlist_id}) for {username}")
-        
-        # Make it private using Navidrome's updatePlaylist extension (public=false)
-        update_params = {'playlistId': playlist_id, 'public': 'false'}
-        update_data = nd_request('updatePlaylist', username, update_params)
-        if update_data:
-            logger.info(f"Successfully set playlist {playlist_id} to private for {username}")
-            
-    except Exception as e:
-        db.rollback()  # CRITICAL: reset transaction state after error
-        logger.exception(f"Failed to create/update playlist for {username}: {e}")
-    finally:
-        cur.close()
-
 def run_batch_task():
     """Main entry point executed by the AudioMuse-AI Cron scheduler or RQ worker."""
     
