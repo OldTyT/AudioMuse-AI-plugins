@@ -357,7 +357,6 @@ def get_matching_playlists(username, base_playlist_name):
     matching.sort(key=lambda x: x['date'], reverse=True)
     return matching
 
-
 def create_private_playlist(username, canonical_ids):
     """Creates or updates a dated playlist and rotates old ones."""
     logger.info(f"[create_private_playlist] START - username={username}, tracks={len(canonical_ids)}")
@@ -388,9 +387,19 @@ def create_private_playlist(username, canonical_ids):
         logger.info(f"[create_private_playlist] Mapped to {len(navidrome_ids)} Navidrome IDs")
         
         base_playlist_name = get_s('playlist_name')
-        playlists_to_keep = get_s('playlists_to_keep')
+        # Ensure playlists_to_keep is an integer for list slicing
+        try:
+            playlists_to_keep = int(get_s('playlists_to_keep') or 3)
+        except (ValueError, TypeError):
+            playlists_to_keep = 3
+            
         today_str = date.today().strftime('%Y-%m-%d')
         full_playlist_name = f"[{username}] {base_playlist_name} - {today_str}"
+        
+        # FIXED: Define missing variables that are used below
+        base_url_full = get_s('navidrome_url').rstrip('/')
+        extauth_header = get_s('extauth_header')
+        headers = {extauth_header: username}
         
         logger.info(f"[create_private_playlist] Playlist name: {full_playlist_name}")
         logger.info(f"[create_private_playlist] playlists_to_keep: {playlists_to_keep}")
@@ -405,7 +414,6 @@ def create_private_playlist(username, canonical_ids):
         for i, pl in enumerate(matching_playlists):
             logger.debug(f"[create_private_playlist]   #{i}: {pl['name']} ({pl['date_str']})")
 
-        
         # ============================================================
         # STEP 2: Check if today's playlist already exists
         # ============================================================
@@ -413,6 +421,7 @@ def create_private_playlist(username, canonical_ids):
         for pl in matching_playlists:
             if pl['date_str'] == today_str:
                 today_playlist_id = pl['id']
+                logger.info(f"[create_private_playlist] Today's playlist already exists: {pl['name']}")
                 break
         
         # ============================================================
@@ -420,37 +429,36 @@ def create_private_playlist(username, canonical_ids):
         # ============================================================
         playlists_to_delete = []
         if today_playlist_id:
-            # Today's playlist already exists: keep it, delete extras beyond playlists_to_keep
-            # matching_playlists is sorted newest first; today's should be index 0
             playlists_to_delete = matching_playlists[playlists_to_keep:]
+            logger.info(f"[create_private_playlist] Today's playlist exists, deleting {len(playlists_to_delete)} oldest")
         else:
-            # Today's playlist doesn't exist yet: we'll create one,
-            # so keep only (playlists_to_keep - 1) existing ones to make room
-            playlists_to_delete = matching_playlists[playlists_to_keep - 1:]
+            playlists_to_delete = matching_playlists[max(0, playlists_to_keep - 1):]
+            logger.info(f"[create_private_playlist] No today's playlist, deleting {len(playlists_to_delete)} oldest to make room")
         
         deleted_count = 0
         for pl in playlists_to_delete:
             try:
+                logger.info(f"[create_private_playlist] Deleting playlist: {pl['name']} (ID: {pl['id']})")
                 delete_data = nd_request('deletePlaylist', username, {'id': pl['id']})
                 if delete_data:
                     deleted_count += 1
-                    logger.info(f"Deleted old playlist: {pl['name']} (ID: {pl['id']})")
+                    logger.info(f"[create_private_playlist] ✓ Deleted: {pl['name']}")
+                else:
+                    logger.warning(f"[create_private_playlist] ✗ Delete returned None for: {pl['name']}")
             except Exception as e:
-                logger.error(f"Failed to delete playlist {pl['name']}: {e}")
+                logger.error(f"[create_private_playlist] Delete error for {pl['name']}: {e}")
         
         if deleted_count > 0:
-            logger.info(f"Rotation for {username}: deleted {deleted_count} old playlist(s).")
+            logger.info(f"[create_private_playlist] Rotation complete: deleted {deleted_count} old playlist(s)")
         
         # ============================================================
         # STEP 4: Create or update the playlist
         # ============================================================
         if today_playlist_id:
-            # Today's playlist already exists - UPDATE it using createPlaylist with playlistId
-            logger.info(f"Updating existing playlist '{full_playlist_name}' (ID: {today_playlist_id})")
+            logger.info(f"[create_private_playlist] Updating existing playlist: {full_playlist_name}")
             base_params = {'playlistId': today_playlist_id, 'name': full_playlist_name}
         else:
-            # Create brand new playlist
-            logger.info(f"Creating new playlist '{full_playlist_name}'")
+            logger.info(f"[create_private_playlist] Creating NEW playlist: {full_playlist_name}")
             base_params = {'name': full_playlist_name}
         
         song_ids_param = [('songId', tid) for tid in navidrome_ids]
@@ -458,28 +466,34 @@ def create_private_playlist(username, canonical_ids):
         song_query = urlencode(song_ids_param, doseq=True)
         full_url = f"{base_url_full}/rest/createPlaylist.view?{query}&{song_query}&v=1.16.1&c=AudioMusePlugin&f=json"
         
+        logger.info(f"[create_private_playlist] Calling createPlaylist API...")
         res = requests.get(full_url, headers=headers, timeout=15)
         res.raise_for_status()
         data = res.json()
         
         playlist_id = data.get('subsonic-response', {}).get('playlist', {}).get('id')
         if not playlist_id:
-            logger.error(f"Failed to parse playlist ID from createPlaylist for user {username}")
+            logger.error(f"[create_private_playlist] Failed to parse playlist ID from response")
             return
         
-        logger.info(f"Playlist '{full_playlist_name}' created/updated successfully (ID: {playlist_id})")
+        logger.info(f"[create_private_playlist] ✓ Playlist created/updated: {full_playlist_name} (ID: {playlist_id})")
         
         # ============================================================
         # STEP 5: Make it private
         # ============================================================
+        logger.info(f"[create_private_playlist] Setting playlist to private...")
         update_params = {'playlistId': playlist_id, 'public': 'false'}
         update_data = nd_request('updatePlaylist', username, update_params)
         if update_data:
-            logger.info(f"Set playlist {playlist_id} to private for {username}")
+            logger.info(f"[create_private_playlist] ✓ Set playlist {playlist_id} to private")
+        else:
+            logger.warning(f"[create_private_playlist] ✗ Failed to set private flag")
+        
+        logger.info(f"[create_private_playlist] DONE for {username}")
         
     except Exception as e:
         db.rollback()
-        logger.exception(f"Failed to create/update playlist for {username}: {e}")
+        logger.exception(f"[create_private_playlist] FATAL ERROR for {username}: {e}")
     finally:
         cur.close()
 
