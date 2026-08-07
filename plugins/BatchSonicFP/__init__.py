@@ -24,7 +24,6 @@ bp = Blueprint('batch_sonic_fp', __name__)
 DEFAULT_SETTINGS = {
     'navidrome_url': 'http://navidrome:4533',
     'admin_username': 'navidrome',      # Tech admin used to fetch the user list
-    'admin_password': '',               # Admin password (stored encrypted by AudioMuse core)
     'extauth_header': 'Remote-User',    # Matches ND_EXTAUTH_USERHEADER in Navidrome
     'playlist_name': 'My Sonic Fingerprint',
     'max_tracks': 50,                   # Final playlist size
@@ -58,20 +57,23 @@ def get_all_users():
     """Fetches the list of all users using admin credentials via Subsonic getUsers."""
     base_url = get_s('navidrome_url').rstrip('/')
     admin_user = get_s('admin_username')
-    admin_pass = get_s('admin_password')
-    
-    if not admin_user or not admin_pass:
+    extauth_header = get_s('extauth_header')
+
+    if not admin_user:
         logger.error("Admin credentials not configured in plugin settings.")
         return []
 
-    params = {'u': admin_user, 'p': admin_pass, 'v': '1.16.1', 'c': 'AudioMusePlugin', 'f': 'json'}
+    headers = {extauth_header: admin_user}
+
     try:
-        res = requests.get(f"{base_url}/rest/getUsers.view", params=params, timeout=15)
+        res = requests.get(f"{base_url}/api/user", headers=headers, timeout=15)
         res.raise_for_status()
         data = res.json()
-        
-        users_raw = data.get('subsonic-response', {}).get('users', {}).get('user', [])
-        users = [u.get('username') for u in _parse_subsonic_list(users_raw)]
+
+        users_raw = data
+        users = []
+        for user in users_raw:
+            users.append(user["userName"])
         return users
     except Exception as e:
         logger.error(f"Failed to fetch Navidrome users: {e}")
@@ -513,7 +515,6 @@ def settings():
     if request.method == 'POST':
         set_setting('navidrome_url', request.form.get('navidrome_url', DEFAULT_SETTINGS['navidrome_url']))
         set_setting('admin_username', request.form.get('admin_username', ''))
-        set_setting('admin_password', request.form.get('admin_password', ''))
         set_setting('extauth_header', request.form.get('extauth_header', DEFAULT_SETTINGS['extauth_header']))
         set_setting('playlist_name', request.form.get('playlist_name', DEFAULT_SETTINGS['playlist_name']))
         
@@ -534,7 +535,6 @@ def settings():
         '<h4>Navidrome Connection</h4>'
         f'<label>Navidrome URL:<br><input type="text" name="navidrome_url" value="{get_s("navidrome_url")}" style="width:100%;max-width:400px;"></label><br><br>'
         f'<label>Admin Username (must have permissions to list all users):<br><input type="text" name="admin_username" value="{get_s("admin_username")}"></label><br><br>'
-        f'<label>Admin Password:<br><input type="password" name="admin_password" value="{get_s("admin_password")}"></label><br><br>'
         '<hr>'
         '<h4>ND_EXTAUTH & Playlist Settings</h4>'
         f'<label>ND_EXTAUTH_USERHEADER Name (from Navidrome config):<br><input type="text" name="extauth_header" value="{get_s("extauth_header")}"></label><br><br>'
