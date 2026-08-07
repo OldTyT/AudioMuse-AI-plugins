@@ -5,13 +5,14 @@ from datetime import datetime, timezone
 
 import requests
 import numpy as np
-from flask import Blueprint, request, redirect
+from flask import Blueprint, request, redirect, url_for, flash
 
 from rq import Queue
 from redis import Redis
-from flask import flash, current_app
+from flask import flash
 from database import save_task_status
 
+import config
 from plugin.api import (
     get_db, get_setting, set_setting, render_page, manage_plugins_url, table
 )
@@ -383,40 +384,66 @@ def run_batch_task():
 
 @bp.route('/')
 def home():
-    body = (
-        '<h3>Batch Sonic Fingerprint for Navidrome (ND_EXTAUTH)</h3>'
-        '<p>This plugin generates personalized Sonic Fingerprints for <strong>all Navidrome users</strong> '
-        'without requiring their passwords.</p>'
-        '<h4>Run Options</h4>'
-        '<p><strong>Cron Task ID:</strong> <code>plugin.batch_sonic_fp.run</code></p>'
-        '<p>Go to <strong>Administration &gt; Scheduled Tasks</strong> to configure the automatic schedule.</p>'
+    # Generate URLs using Flask's url_for with blueprint prefix
+    settings_url = url_for('batch_sonic_fp.settings')
+    run_now_url = url_for('batch_sonic_fp.run_now')
+    
+    body = f'''
+        <h3>Batch Sonic Fingerprint for Navidrome (ND_EXTAUTH)</h3>
+        <p>This plugin generates personalized Sonic Fingerprints for <strong>all Navidrome users</strong> 
+        without requiring their passwords. It utilizes Navidrome's externalized authentication headers.</p>
         
-        '<form method="post" action="' + bp.url_for('run_now') + '" style="display:inline-block;">'
-        '<button type="submit" class="btn btn-success" style="margin:.5rem 0;">'
-        '▶ Run Now (Manual Trigger)</button>'
-        '</form>'
+        <hr style="margin: 1.5rem 0;">
         
-        '<hr>'
-        '<p><a href="' + manage_plugins_url() + '" class="btn btn-primary">Back to Plugins</a></p>'
-    )
+        <h4>Configuration & Management</h4>
+        <div style="display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem;">
+            <a href="{settings_url}" class="btn btn-primary" style="flex: 1; min-width: 150px; text-align: center; text-decoration: none; padding: .5rem 1rem; background: #007bff; color: white; border-radius: 4px;">
+                ⚙️ Plugin Settings
+            </a>
+            
+            <a href="{manage_plugins_url()}" class="btn btn-secondary" style="flex: 1; min-width: 150px; text-align: center; text-decoration: none; padding: .5rem 1rem; background: #6c757d; color: white; border-radius: 4px;">
+                📦 Manage Plugins
+            </a>
+        </div>
+        
+        <hr style="margin: 1.5rem 0;">
+        
+        <h4>Task Execution</h4>
+        <p style="margin-bottom: 1rem;">
+            <strong>Cron Task ID:</strong> <code>plugin.batch_sonic_fp.run</code><br>
+            To configure the automatic schedule, go to <strong>Administration &gt; Scheduled Tasks</strong> in the main menu.
+        </p>
+        
+        <form method="post" action="{run_now_url}" style="display: inline-block;">
+            <button type="submit" class="btn btn-success" 
+                    style="margin: .5rem 0; padding: .6rem 1.2rem; background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 1rem;"
+                    onclick="return confirm('Start batch generation for all Navidrome users now? This may take a while.');">
+                ▶ Run Now (Manual Trigger)
+            </button>
+        </form>
+        
+        <p style="margin-top: 1rem; color: #666; font-size: .9rem;">
+            <em>After clicking "Run Now", the task will appear in the main Tasks Panel on the dashboard. 
+            You can monitor progress there.</em>
+        </p>
+    '''
     return render_page(body, title='Batch Sonic FP')
 
 @bp.route('/run-now', methods=['POST'])
 def run_now():
     """Manually trigger the batch task outside of cron."""
     try:
-        # Use the same Redis connection as the AudioMuse worker
-        redis_url = current_app.config.get('REDIS_URL', 'redis://redis:6379/0')
+        # Safely get Redis URL from Flask app config, fallback to Docker default
+        redis_url = config.REDIS_URL
         redis_conn = Redis.from_url(redis_url)
         
-        # AudioMuse uses 'high' queue for critical/coordinator tasks
+        # Use 'high' queue for critical/coordinator tasks
         q = Queue('high', connection=redis_conn)
-        job = q.enqueue(
-            'plugins.BatchSonicFP.run_batch_task',  # Adjust to your actual plugin module path
-            job_timeout='2h'
-        )
         
-        # Initialize task status so it appears in the UI task panel
+        # Pass the function object directly to avoid import path issues in RQ
+        job = q.enqueue(run_batch_task, job_timeout='2h')
+        
+        # Initialize task status so it appears in the UI task panel immediately
         save_task_status(
             job.id, 'sonic_fingerprint', 'started', progress=0,
             details={"message": "Manual batch run triggered by admin..."}
@@ -425,8 +452,10 @@ def run_now():
         flash(f"Task started successfully. Job ID: {job.id}", "success")
     except Exception as e:
         flash(f"Failed to start task: {str(e)}", "error")
+        logger.exception("Error enqueuing manual run")
         
-    return redirect(request.referrer or bp.url_for('home'))
+    # Redirect back to home page or plugin home
+    return redirect(request.referrer or url_for('batch_sonic_fp.home'))
 
 @bp.route('/settings', methods=['GET', 'POST'])
 def settings():
@@ -475,6 +504,7 @@ def register(ctx):
     ctx.on_install(migrate)
     ctx.add_blueprint(bp)
     ctx.add_menu_item('Batch Sonic FP', 'batch_sonic_fp.home', admin_only=True)
+    ctx.add_menu_item('Batch FP Settings', 'batch_sonic_fp.settings', admin_only=True)
     
     # Registers the task in the global Cron manager.
     # Visible in AudioMuse UI as: plugin.batch_sonic_fp.run
