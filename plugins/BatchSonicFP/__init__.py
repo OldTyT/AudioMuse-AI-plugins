@@ -7,6 +7,11 @@ import requests
 import numpy as np
 from flask import Blueprint, request, redirect
 
+from rq import Queue
+from redis import Redis
+from flask import flash, current_app
+from database import save_task_status
+
 from plugin.api import (
     get_db, get_setting, set_setting, render_page, manage_plugins_url, table
 )
@@ -381,12 +386,47 @@ def home():
     body = (
         '<h3>Batch Sonic Fingerprint for Navidrome (ND_EXTAUTH)</h3>'
         '<p>This plugin generates personalized Sonic Fingerprints for <strong>all Navidrome users</strong> '
-        'without requiring their passwords. It utilizes Navidrome\'s externalized authentication headers.</p>'
+        'without requiring their passwords.</p>'
+        '<h4>Run Options</h4>'
         '<p><strong>Cron Task ID:</strong> <code>plugin.batch_sonic_fp.run</code></p>'
-        '<p>Go to <strong>Administration &gt; Scheduled Tasks</strong> in the main menu to configure the execution schedule (e.g., <code>0 2 * * *</code> for daily runs at 2 AM).</p>'
-        f'<p><a href="{manage_plugins_url()}" class="btn btn-primary">Back to Plugins</a></p>'
+        '<p>Go to <strong>Administration &gt; Scheduled Tasks</strong> to configure the automatic schedule.</p>'
+        
+        '<form method="post" action="' + bp.url_for('run_now') + '" style="display:inline-block;">'
+        '<button type="submit" class="btn btn-success" style="margin:.5rem 0;">'
+        '▶ Run Now (Manual Trigger)</button>'
+        '</form>'
+        
+        '<hr>'
+        '<p><a href="' + manage_plugins_url() + '" class="btn btn-primary">Back to Plugins</a></p>'
     )
     return render_page(body, title='Batch Sonic FP')
+
+@bp.route('/run-now', methods=['POST'])
+def run_now():
+    """Manually trigger the batch task outside of cron."""
+    try:
+        # Use the same Redis connection as the AudioMuse worker
+        redis_url = current_app.config.get('REDIS_URL', 'redis://redis:6379/0')
+        redis_conn = Redis.from_url(redis_url)
+        
+        # AudioMuse uses 'high' queue for critical/coordinator tasks
+        q = Queue('high', connection=redis_conn)
+        job = q.enqueue(
+            'plugins.BatchSonicFP.run_batch_task',  # Adjust to your actual plugin module path
+            job_timeout='2h'
+        )
+        
+        # Initialize task status so it appears in the UI task panel
+        save_task_status(
+            job.id, 'sonic_fingerprint', 'started', progress=0,
+            details={"message": "Manual batch run triggered by admin..."}
+        )
+        
+        flash(f"Task started successfully. Job ID: {job.id}", "success")
+    except Exception as e:
+        flash(f"Failed to start task: {str(e)}", "error")
+        
+    return redirect(request.referrer or bp.url_for('home'))
 
 @bp.route('/settings', methods=['GET', 'POST'])
 def settings():
