@@ -140,19 +140,28 @@ def get_server_id():
     db = get_db()
     cur = db.cursor()
     base_url = get_s('navidrome_url').rstrip('/')
-    # Clean URL for fuzzy matching
     clean_url = base_url.replace('http://', '').replace('https://', '')
     
-    cur.execute("SELECT id FROM music_servers WHERE type = 'navidrome' AND url LIKE %s", (f"%{clean_url}%",))
-    row = cur.fetchone()
-    
-    # Fallback to any navidrome server if fuzzy match fails
-    if not row:
-        cur.execute("SELECT id FROM music_servers WHERE type = 'navidrome' LIMIT 1")
+    try:
+        # FIXED: column is 'server_id', not 'id'; column is 'server_type', not 'type'
+        cur.execute(
+            "SELECT server_id FROM music_servers WHERE server_type = 'navidrome' AND creds::text LIKE %s",
+            (f"%{clean_url}%",)
+        )
         row = cur.fetchone()
         
-    cur.close()
-    return row[0] if row else None
+        # Fallback to any navidrome server if fuzzy match fails
+        if not row:
+            cur.execute("SELECT server_id FROM music_servers WHERE server_type = 'navidrome' LIMIT 1")
+            row = cur.fetchone()
+            
+        return row[0] if row else None
+    except Exception as e:
+        db.rollback()  # CRITICAL: reset transaction state after error
+        logger.error(f"Failed to get server_id: {e}")
+        return None
+    finally:
+        cur.close()
 
 def compute_fingerprint_vector(username, top_tracks):
     """
@@ -167,77 +176,85 @@ def compute_fingerprint_vector(username, top_tracks):
     db = get_db()
     cur = db.cursor()
     
+    # FIXED: field is 'provider_track_id', not 'provider_id'
     provider_ids = [t['provider_id'] for t in top_tracks]
     
-    # Map provider IDs to canonical item_ids
-    cur.execute(
-        "SELECT provider_id, item_id FROM track_server_map WHERE server_id = %s AND provider_id = ANY(%s)",
-        (server_id, provider_ids)
-    )
-    id_map = {row[0]: row[1] for row in cur.fetchall()}
-    
-    # Filter out tracks that haven't been analyzed by AudioMuse yet
-    valid_tracks = [t for t in top_tracks if t['provider_id'] in id_map]
-    if not valid_tracks:
-        logger.warning(f"No analyzed tracks found in AudioMuse-AI for user {username}.")
-        return None
+    try:
+        # FIXED: column is 'provider_track_id', not 'provider_id'
+        cur.execute(
+            "SELECT provider_track_id, item_id FROM track_server_map WHERE server_id = %s AND provider_track_id = ANY(%s)",
+            (server_id, provider_ids)
+        )
+        id_map = {row[0]: row[1] for row in cur.fetchall()}
         
-    canonical_ids = [id_map[t['provider_id']] for t in valid_tracks]
-    
-    # Fetch embeddings from the core database
-    cur.execute(
-        "SELECT item_id, embedding_vector FROM score WHERE item_id = ANY(%s) AND embedding_vector IS NOT NULL",
-        (canonical_ids,)
-    )
-    embeddings_map = {row[0]: np.array(row[1]) for row in cur.fetchall() if row[1] is not None}
-    cur.close()
-    
-    if not embeddings_map:
-        logger.warning(f"No embeddings found for user {username}'s top tracks.")
-        return None
-        
-    # Calculate weighted average vector (decay based on recency and play count)
-    weighted_vectors = []
-    total_weight = 0.0
-    
-    for track in valid_tracks:
-        cid = id_map[track['provider_id']]
-        if cid not in embeddings_map:
-            continue
+        # Filter out tracks that haven't been analyzed by AudioMuse yet
+        valid_tracks = [t for t in top_tracks if t['provider_id'] in id_map]
+        if not valid_tracks:
+            logger.warning(f"No analyzed tracks found in AudioMuse-AI for user {username}.")
+            return None
             
-        vector = embeddings_map[cid]
-        play_count = track['playCount']
+        canonical_ids = [id_map[t['provider_id']] for t in valid_tracks]
         
-        # Logarithmic weight to prevent single massive playcount from dominating
-        weight = math.log10(play_count + 1)
+        # Fetch embeddings from the core database
+        cur.execute(
+            "SELECT item_id, embedding_vector FROM score WHERE item_id = ANY(%s) AND embedding_vector IS NOT NULL",
+            (canonical_ids,)
+        )
+        embeddings_map = {row[0]: np.array(row[1]) for row in cur.fetchall() if row[1] is not None}
         
-        # Apply time-decay based on last played date
-        if track.get('played'):
-            try:
-                played_str = track['played']
-                # Fix potential microsecond formatting issues in Subsonic dates
-                if '.' in played_str and played_str.endswith('Z'):
-                    dot_idx = played_str.rfind('.')
-                    played_str = played_str[:dot_idx + 7] + 'Z'
-                last_played_dt = datetime.fromisoformat(played_str.replace('Z', '+00:00'))
-                days_ago = (datetime.now(timezone.utc) - last_played_dt).days
+        if not embeddings_map:
+            logger.warning(f"No embeddings found for user {username}'s top tracks.")
+            return None
+            
+        # Calculate weighted average vector (decay based on recency and play count)
+        weighted_vectors = []
+        total_weight = 0.0
+        
+        for track in valid_tracks:
+            cid = id_map[track['provider_id']]
+            if cid not in embeddings_map:
+                continue
                 
-                half_life = 30.0 # Days
-                decay_rate = -math.log(0.5) / half_life
-                weight *= math.exp(-decay_rate * max(0, days_ago))
-            except Exception:
-                pass
-                
-        weighted_vectors.append(vector * weight)
-        total_weight += weight
+            vector = embeddings_map[cid]
+            play_count = track['playCount']
+            
+            # Logarithmic weight to prevent single massive playcount from dominating
+            weight = math.log10(play_count + 1)
+            
+            # Apply time-decay based on last played date
+            if track.get('played'):
+                try:
+                    played_str = track['played']
+                    # Fix potential microsecond formatting issues in Subsonic dates
+                    if '.' in played_str and played_str.endswith('Z'):
+                        dot_idx = played_str.rfind('.')
+                        played_str = played_str[:dot_idx + 7] + 'Z'
+                    last_played_dt = datetime.fromisoformat(played_str.replace('Z', '+00:00'))
+                    days_ago = (datetime.now(timezone.utc) - last_played_dt).days
+                    
+                    half_life = 30.0 # Days
+                    decay_rate = -math.log(0.5) / half_life
+                    weight *= math.exp(-decay_rate * max(0, days_ago))
+                except Exception:
+                    pass
+                    
+            weighted_vectors.append(vector * weight)
+            total_weight += weight
+            
+        if total_weight == 0:
+            return None
+            
+        average_vector = np.sum(weighted_vectors, axis=0) / total_weight
+        valid_seed_ids = [id_map[t['provider_id']] for t in valid_tracks if id_map[t['provider_id']] in embeddings_map]
         
-    if total_weight == 0:
+        return average_vector, valid_seed_ids
+        
+    except Exception as e:
+        db.rollback()  # CRITICAL: reset transaction state after error
+        logger.error(f"compute_fingerprint_vector failed: {e}")
         return None
-        
-    average_vector = np.sum(weighted_vectors, axis=0) / total_weight
-    valid_seed_ids = [id_map[t['provider_id']] for t in valid_tracks if id_map[t['provider_id']] in embeddings_map]
-    
-    return average_vector, valid_seed_ids
+    finally:
+        cur.close()
 
 def get_similar_tracks(average_vector, num_neighbors):
     """
@@ -252,27 +269,34 @@ def get_similar_tracks(average_vector, num_neighbors):
         
     db = get_db()
     cur = db.cursor()
-    cur.execute("SELECT item_id, embedding_vector FROM score WHERE embedding_vector IS NOT NULL")
     
-    similarities = []
-    norm_query = np.linalg.norm(average_vector)
-    if norm_query == 0:
-        cur.close()
+    try:
+        cur.execute("SELECT item_id, embedding_vector FROM score WHERE embedding_vector IS NOT NULL")
+        
+        similarities = []
+        norm_query = np.linalg.norm(average_vector)
+        if norm_query == 0:
+            return []
+            
+        for row in cur.fetchall():
+            cid, vec = row
+            if vec is None: continue
+            vec = np.array(vec)
+            norm_vec = np.linalg.norm(vec)
+            if norm_vec == 0: continue
+            
+            cos_sim = np.dot(average_vector, vec) / (norm_query * norm_vec)
+            similarities.append({'item_id': cid, 'distance': 1.0 - cos_sim})
+            
+        similarities.sort(key=lambda x: x['distance'])
+        return similarities[:num_neighbors]
+        
+    except Exception as e:
+        db.rollback()  # CRITICAL: reset transaction state after error
+        logger.error(f"get_similar_tracks failed: {e}")
         return []
-        
-    for row in cur.fetchall():
-        cid, vec = row
-        if vec is None: continue
-        vec = np.array(vec)
-        norm_vec = np.linalg.norm(vec)
-        if norm_vec == 0: continue
-        
-        cos_sim = np.dot(average_vector, vec) / (norm_query * norm_vec)
-        similarities.append({'item_id': cid, 'distance': 1.0 - cos_sim})
-        
-    cur.close()
-    similarities.sort(key=lambda x: x['distance'])
-    return similarities[:num_neighbors]
+    finally:
+        cur.close()
 
 def create_private_playlist(username, canonical_ids):
     """Reverse maps canonical IDs to Navidrome IDs, creates the playlist, and hides it."""
@@ -282,33 +306,32 @@ def create_private_playlist(username, canonical_ids):
     db = get_db()
     cur = db.cursor()
     
-    # Reverse map to get Navidrome provider IDs
-    cur.execute(
-        "SELECT item_id, provider_id FROM track_server_map WHERE server_id = %s AND item_id = ANY(%s)",
-        (server_id, canonical_ids)
-    )
-    reverse_map = {row[0]: row[1] for row in cur.fetchall()}
-    cur.close()
-    
-    navidrome_ids = [reverse_map[cid] for cid in canonical_ids if cid in reverse_map]
-    if not navidrome_ids:
-        logger.error(f"No valid provider IDs found to create playlist for user {username}.")
-        return
-        
-    playlist_name = get_s('playlist_name')
-    base_url_full = get_s('navidrome_url').rstrip('/')
-    extauth_header = get_s('extauth_header')
-    headers = {extauth_header: username}
-    
-    # Subsonic createPlaylist requires an array of songId parameters
-    base_params = {'name': playlist_name}
-    song_ids_param = [('songId', tid) for tid in navidrome_ids]
-    
-    query = urlencode(base_params)
-    song_query = urlencode(song_ids_param, doseq=True)
-    full_url = f"{base_url_full}/rest/createPlaylist.view?{query}&{song_query}&v=1.16.1&c=AudioMusePlugin&f=json"
-    
     try:
+        # FIXED: column is 'provider_track_id', not 'provider_id'
+        cur.execute(
+            "SELECT item_id, provider_track_id FROM track_server_map WHERE server_id = %s AND item_id = ANY(%s)",
+            (server_id, canonical_ids)
+        )
+        reverse_map = {row[0]: row[1] for row in cur.fetchall()}
+        
+        navidrome_ids = [reverse_map[cid] for cid in canonical_ids if cid in reverse_map]
+        if not navidrome_ids:
+            logger.error(f"No valid provider IDs found to create playlist for user {username}.")
+            return
+            
+        playlist_name = get_s('playlist_name')
+        base_url_full = get_s('navidrome_url').rstrip('/')
+        extauth_header = get_s('extauth_header')
+        headers = {extauth_header: username}
+        
+        # Subsonic createPlaylist requires an array of songId parameters
+        base_params = {'name': playlist_name}
+        song_ids_param = [('songId', tid) for tid in navidrome_ids]
+        
+        query = urlencode(base_params)
+        song_query = urlencode(song_ids_param, doseq=True)
+        full_url = f"{base_url_full}/rest/createPlaylist.view?{query}&{song_query}&v=1.16.1&c=AudioMusePlugin&f=json"
+        
         res = requests.get(full_url, headers=headers, timeout=15)
         res.raise_for_status()
         data = res.json()
@@ -327,7 +350,10 @@ def create_private_playlist(username, canonical_ids):
             logger.info(f"Successfully set playlist {playlist_id} to private for {username}")
             
     except Exception as e:
+        db.rollback()  # CRITICAL: reset transaction state after error
         logger.exception(f"Failed to create/update playlist for {username}: {e}")
+    finally:
+        cur.close()
 
 def run_batch_task():
     """Main entry point executed by the AudioMuse-AI Cron scheduler or RQ worker."""
