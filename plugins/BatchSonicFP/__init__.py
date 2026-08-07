@@ -1,7 +1,8 @@
+import re
 import logging
 import math
+from datetime import datetime, timezone, date
 from urllib.parse import urlencode
-from datetime import datetime, timezone
 
 import requests
 import numpy as np
@@ -321,7 +322,8 @@ def get_similar_tracks(average_vector, num_neighbors):
         cur.close()
 
 def create_private_playlist(username, canonical_ids):
-    """Reverse maps canonical IDs to Navidrome IDs, creates the playlist, and hides it."""
+    """Reverse maps canonical IDs to Navidrome IDs, creates the playlist, 
+    hides it, and rotates to keep only the last 3 for this user."""
     server_id = get_server_id()
     if not server_id: return
     
@@ -341,13 +343,17 @@ def create_private_playlist(username, canonical_ids):
             logger.error(f"No valid provider IDs found to create playlist for user {username}.")
             return
             
-        playlist_name = get_s('playlist_name')
+        # Build playlist name with username and today's date
+        base_playlist_name = get_s('playlist_name')
+        today_str = date.today().strftime('%Y-%m-%d')
+        full_playlist_name = f"[{username}] {base_playlist_name} - {today_str}"
+        
         base_url_full = get_s('navidrome_url').rstrip('/')
         extauth_header = get_s('extauth_header')
         headers = {extauth_header: username}
         
         # Subsonic createPlaylist requires an array of songId parameters
-        base_params = {'name': playlist_name}
+        base_params = {'name': full_playlist_name}
         song_ids_param = [('songId', tid) for tid in navidrome_ids]
         
         query = urlencode(base_params)
@@ -363,19 +369,95 @@ def create_private_playlist(username, canonical_ids):
             logger.error(f"Failed to parse playlist ID from createPlaylist for user {username}")
             return
             
-        logger.info(f"Created playlist '{playlist_name}' (ID: {playlist_id}) for {username}")
+        logger.info(f"Created playlist '{full_playlist_name}' (ID: {playlist_id}) for {username}")
         
         # Make it private using Navidrome's updatePlaylist extension (public=false)
         update_params = {'playlistId': playlist_id, 'public': 'false'}
         update_data = nd_request('updatePlaylist', username, update_params)
         if update_data:
             logger.info(f"Successfully set playlist {playlist_id} to private for {username}")
+        
+        # Rotate playlists: keep only the last 3 for this user
+        rotate_user_playlists(username, base_playlist_name, today_str)
             
     except Exception as e:
         db.rollback()  # CRITICAL: reset transaction state after error
         logger.exception(f"Failed to create/update playlist for {username}: {e}")
     finally:
         cur.close()
+
+
+def rotate_user_playlists(username, base_playlist_name, current_date_str):
+    """
+    Fetches all playlists for the user, filters by the mask:
+    '[{username}] {base_playlist_name} - YYYY-MM-DD'
+    Keeps only the last 3 playlists by date, deletes the rest.
+    """
+    try:
+        # Fetch all user's playlists via Subsonic API
+        playlists_data = nd_request('getPlaylists', username)
+        if not playlists_data:
+            logger.warning(f"Could not fetch playlists for user {username} during rotation.")
+            return
+        
+        playlists_raw = playlists_data.get('subsonic-response', {}).get('playlists', {}).get('playlist', [])
+        playlists = _parse_subsonic_list(playlists_raw)
+        
+        # Build regex pattern to match the naming convention
+        # Escape username and base_playlist_name for regex safety
+        escaped_username = re.escape(username)
+        escaped_name = re.escape(base_playlist_name)
+        pattern = rf'^\[{escaped_username}\] {escaped_name} - (\d{{4}}-\d{{2}}-\d{{2}})$'
+        
+        matching_playlists = []
+        for pl in playlists:
+            pl_name = pl.get('name', '')
+            pl_id = pl.get('id')
+            
+            # Check if playlist name matches our mask
+            match = re.match(pattern, pl_name)
+            if match and pl_id:
+                date_str = match.group(1)
+                try:
+                    pl_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                    matching_playlists.append({
+                        'id': pl_id,
+                        'name': pl_name,
+                        'date': pl_date,
+                        'date_str': date_str
+                    })
+                except ValueError:
+                    logger.warning(f"Could not parse date from playlist name: {pl_name}")
+        
+        # Sort by date descending (newest first)
+        matching_playlists.sort(key=lambda x: x['date'], reverse=True)
+        
+        # Keep only the last 3, mark the rest for deletion
+        to_keep = matching_playlists[:3]
+        to_delete = matching_playlists[3:]
+        
+        if not to_delete:
+            logger.info(f"User {username} has {len(matching_playlists)} matching playlist(s). No rotation needed.")
+            return
+        
+        logger.info(f"Rotating playlists for {username}: keeping {len(to_keep)}, deleting {len(to_delete)} old ones.")
+        
+        # Delete old playlists
+        deleted_count = 0
+        for pl in to_delete:
+            try:
+                # Delete playlist via Subsonic API
+                delete_data = nd_request('deletePlaylist', username, {'id': pl['id']})
+                if delete_data:
+                    deleted_count += 1
+                    logger.debug(f"Deleted old playlist: {pl['name']} (ID: {pl['id']})")
+            except Exception as e:
+                logger.error(f"Failed to delete playlist {pl['name']}: {e}")
+        
+        logger.info(f"Successfully rotated playlists for {username}: kept {len(to_keep)}, deleted {deleted_count}.")
+        
+    except Exception as e:
+        logger.exception(f"Failed to rotate playlists for user {username}: {e}")
 
 def create_private_playlist(username, canonical_ids):
     """Reverse maps canonical IDs to Navidrome IDs, creates the playlist, and hides it."""
