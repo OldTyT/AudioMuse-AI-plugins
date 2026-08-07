@@ -6,12 +6,20 @@
   "requirements": [],
   "versions": [
     {
+      "version": "0.0.6",
+      "min_core_version": "2.5.0",
+      "changelog": "Fixes",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
+    {
       "version": "0.0.5",
       "min_core_version": "2.5.0",
       "changelog": "Fixes",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/OldTyT/AudioMuse-AI-plugins/main/dist/batch_sonic_fp/batch_sonic_fp_0.0.5.zip",
-      "checksum": "79764ba7946519b8e0a22046a0167a97"
+      "checksum": "2ef9f554ecd4d93550451aaa9cfe7e50"
     },
     {
       "version": "0.0.4",

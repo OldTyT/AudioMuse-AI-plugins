@@ -143,6 +143,7 @@ def get_server_id():
     clean_url = base_url.replace('http://', '').replace('https://', '')
     
     try:
+        # FIXED: URL is stored inside JSONB 'creds' column, not as a separate column
         # FIXED: column is 'server_id', not 'id'; column is 'server_type', not 'type'
         cur.execute(
             "SELECT server_id FROM music_servers WHERE server_type = 'navidrome' AND creds::text LIKE %s",
@@ -165,9 +166,12 @@ def get_server_id():
 
 def compute_fingerprint_vector(username, top_tracks):
     """
-    Maps Navidrome provider IDs to AudioMuse canonical IDs, fetches embeddings,
-    and computes a weighted average vector representing the user's taste.
+    Maps Navidrome provider IDs to AudioMuse canonical IDs, fetches embeddings
+    using the official get_tracks_by_ids() function, and computes a weighted 
+    average vector representing the user's taste.
     """
+    from database import get_tracks_by_ids
+    
     server_id = get_server_id()
     if not server_id:
         logger.error("No Navidrome server found in AudioMuse-AI music_servers registry.")
@@ -176,7 +180,6 @@ def compute_fingerprint_vector(username, top_tracks):
     db = get_db()
     cur = db.cursor()
     
-    # FIXED: field is 'provider_track_id', not 'provider_id'
     provider_ids = [t['provider_id'] for t in top_tracks]
     
     try:
@@ -195,12 +198,22 @@ def compute_fingerprint_vector(username, top_tracks):
             
         canonical_ids = [id_map[t['provider_id']] for t in valid_tracks]
         
-        # Fetch embeddings from the core database
-        cur.execute(
-            "SELECT item_id, embedding_vector FROM score WHERE item_id = ANY(%s) AND embedding_vector IS NOT NULL",
-            (canonical_ids,)
-        )
-        embeddings_map = {row[0]: np.array(row[1]) for row in cur.fetchall() if row[1] is not None}
+        # FIXED: Use the official get_tracks_by_ids() function from database.py
+        # This properly JOINs score with embedding table and returns embedding_vector as numpy array
+        track_details = get_tracks_by_ids(canonical_ids)
+        
+        if not track_details:
+            logger.warning(f"No track details found in database for user {username}'s top tracks.")
+            return None
+            
+        # Build embeddings map from the returned track details
+        embeddings_map = {}
+        for track in track_details:
+            if 'embedding_vector' in track and track['embedding_vector'] is not None:
+                vec = track['embedding_vector']
+                # get_tracks_by_ids returns numpy array, check if it has data
+                if hasattr(vec, 'size') and vec.size > 0:
+                    embeddings_map[track['item_id']] = vec
         
         if not embeddings_map:
             logger.warning(f"No embeddings found for user {username}'s top tracks.")
@@ -259,34 +272,43 @@ def compute_fingerprint_vector(username, top_tracks):
 def get_similar_tracks(average_vector, num_neighbors):
     """
     Finds similar tracks using the internal IVF index.
-    Falls back to brute-force cosine similarity if the internal module is inaccessible.
+    Falls back to brute-force cosine similarity using get_tracks_by_ids() if IVF is inaccessible.
     """
     try:
         from tasks.ivf_manager import find_nearest_neighbors_by_vector
         return find_nearest_neighbors_by_vector(query_vector=average_vector, n=num_neighbors, eliminate_duplicates=True)
     except ImportError:
         logger.warning("Could not import tasks.ivf_manager. Falling back to brute-force cosine similarity.")
-        
+    
+    from database import get_tracks_by_ids
+    
     db = get_db()
     cur = db.cursor()
     
     try:
-        cur.execute("SELECT item_id, embedding_vector FROM score WHERE embedding_vector IS NOT NULL")
+        # Get all item_ids from score table
+        cur.execute("SELECT item_id FROM score LIMIT 10000")  # Limit for performance
+        all_ids = [row[0] for row in cur.fetchall()]
+        
+        # Use official get_tracks_by_ids() to fetch embeddings
+        all_tracks = get_tracks_by_ids(all_ids)
         
         similarities = []
         norm_query = np.linalg.norm(average_vector)
         if norm_query == 0:
             return []
             
-        for row in cur.fetchall():
-            cid, vec = row
-            if vec is None: continue
-            vec = np.array(vec)
+        for track in all_tracks:
+            vec = track.get('embedding_vector')
+            if vec is None or not hasattr(vec, 'size') or vec.size == 0:
+                continue
+                
             norm_vec = np.linalg.norm(vec)
-            if norm_vec == 0: continue
+            if norm_vec == 0:
+                continue
             
             cos_sim = np.dot(average_vector, vec) / (norm_query * norm_vec)
-            similarities.append({'item_id': cid, 'distance': 1.0 - cos_sim})
+            similarities.append({'item_id': track['item_id'], 'distance': 1.0 - cos_sim})
             
         similarities.sort(key=lambda x: x['distance'])
         return similarities[:num_neighbors]
@@ -295,6 +317,63 @@ def get_similar_tracks(average_vector, num_neighbors):
         db.rollback()  # CRITICAL: reset transaction state after error
         logger.error(f"get_similar_tracks failed: {e}")
         return []
+    finally:
+        cur.close()
+
+def create_private_playlist(username, canonical_ids):
+    """Reverse maps canonical IDs to Navidrome IDs, creates the playlist, and hides it."""
+    server_id = get_server_id()
+    if not server_id: return
+    
+    db = get_db()
+    cur = db.cursor()
+    
+    try:
+        # FIXED: column is 'provider_track_id', not 'provider_id'
+        cur.execute(
+            "SELECT item_id, provider_track_id FROM track_server_map WHERE server_id = %s AND item_id = ANY(%s)",
+            (server_id, canonical_ids)
+        )
+        reverse_map = {row[0]: row[1] for row in cur.fetchall()}
+        
+        navidrome_ids = [reverse_map[cid] for cid in canonical_ids if cid in reverse_map]
+        if not navidrome_ids:
+            logger.error(f"No valid provider IDs found to create playlist for user {username}.")
+            return
+            
+        playlist_name = get_s('playlist_name')
+        base_url_full = get_s('navidrome_url').rstrip('/')
+        extauth_header = get_s('extauth_header')
+        headers = {extauth_header: username}
+        
+        # Subsonic createPlaylist requires an array of songId parameters
+        base_params = {'name': playlist_name}
+        song_ids_param = [('songId', tid) for tid in navidrome_ids]
+        
+        query = urlencode(base_params)
+        song_query = urlencode(song_ids_param, doseq=True)
+        full_url = f"{base_url_full}/rest/createPlaylist.view?{query}&{song_query}&v=1.16.1&c=AudioMusePlugin&f=json"
+        
+        res = requests.get(full_url, headers=headers, timeout=15)
+        res.raise_for_status()
+        data = res.json()
+        
+        playlist_id = data.get('subsonic-response', {}).get('playlist', {}).get('id')
+        if not playlist_id:
+            logger.error(f"Failed to parse playlist ID from createPlaylist for user {username}")
+            return
+            
+        logger.info(f"Created playlist '{playlist_name}' (ID: {playlist_id}) for {username}")
+        
+        # Make it private using Navidrome's updatePlaylist extension (public=false)
+        update_params = {'playlistId': playlist_id, 'public': 'false'}
+        update_data = nd_request('updatePlaylist', username, update_params)
+        if update_data:
+            logger.info(f"Successfully set playlist {playlist_id} to private for {username}")
+            
+    except Exception as e:
+        db.rollback()  # CRITICAL: reset transaction state after error
+        logger.exception(f"Failed to create/update playlist for {username}: {e}")
     finally:
         cur.close()
 
