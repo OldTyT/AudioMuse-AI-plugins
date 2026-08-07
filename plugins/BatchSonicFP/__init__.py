@@ -24,13 +24,14 @@ bp = Blueprint('batch_sonic_fp', __name__)
 # Default settings applied on first installation
 DEFAULT_SETTINGS = {
     'navidrome_url': 'http://navidrome:4533',
-    'admin_username': 'navidrome',      # Tech admin used to fetch the user list
-    'extauth_header': 'Remote-User',    # Matches ND_EXTAUTH_USERHEADER in Navidrome
+    'admin_username': 'navidrome',
+    'extauth_header': 'Remote-User',
     'playlist_name': 'My Sonic Fingerprint',
-    'max_tracks': 50,                   # Final playlist size
-    'top_albums_to_fetch': 20,          # How many frequent albums to scan per user
-    'top_songs_per_user': 50,           # Initial seed pool of top played tracks
-    'num_neighbors': 50                 # Number of similar tracks to find via IVF
+    'max_tracks': 50,
+    'top_albums_to_fetch': 20,
+    'top_songs_per_user': 50,
+    'num_neighbors': 50,
+    'playlists_to_keep': 3,
 }
 
 def get_s(key):
@@ -321,17 +322,56 @@ def get_similar_tracks(average_vector, num_neighbors):
     finally:
         cur.close()
 
+def get_matching_playlists(username, base_playlist_name):
+    """Fetches all playlists matching the naming pattern and returns them sorted by date (newest first)."""
+    playlists_data = nd_request('getPlaylists', username)
+    if not playlists_data:
+        return []
+    
+    playlists_raw = playlists_data.get('subsonic-response', {}).get('playlists', {}).get('playlist', [])
+    playlists = _parse_subsonic_list(playlists_raw)
+    
+    escaped_username = re.escape(username)
+    escaped_name = re.escape(base_playlist_name)
+    pattern = rf'^\[{escaped_username}\] {escaped_name} - (\d{{4}}-\d{{2}}-\d{{2}})$'
+    
+    matching = []
+    for pl in playlists:
+        pl_name = pl.get('name', '')
+        pl_id = pl.get('id')
+        match = re.match(pattern, pl_name)
+        if match and pl_id:
+            date_str = match.group(1)
+            try:
+                pl_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                matching.append({
+                    'id': pl_id,
+                    'name': pl_name,
+                    'date': pl_date,
+                    'date_str': date_str
+                })
+            except ValueError:
+                continue
+    
+    # Sort by date descending (newest first)
+    matching.sort(key=lambda x: x['date'], reverse=True)
+    return matching
+
+
 def create_private_playlist(username, canonical_ids):
-    """Reverse maps canonical IDs to Navidrome IDs, creates the playlist, 
-    hides it, and rotates to keep only the last 3 for this user."""
+    """
+    Creates or updates a dated playlist and rotates old ones.
+    Rotation happens BEFORE creation to avoid exceeding the limit.
+    """
     server_id = get_server_id()
-    if not server_id: return
+    if not server_id:
+        return
     
     db = get_db()
     cur = db.cursor()
     
     try:
-        # FIXED: column is 'provider_track_id', not 'provider_id'
+        # Map canonical IDs to Navidrome provider IDs
         cur.execute(
             "SELECT item_id, provider_track_id FROM track_server_map WHERE server_id = %s AND item_id = ANY(%s)",
             (server_id, canonical_ids)
@@ -342,9 +382,9 @@ def create_private_playlist(username, canonical_ids):
         if not navidrome_ids:
             logger.error(f"No valid provider IDs found to create playlist for user {username}.")
             return
-            
-        # Build playlist name with username and today's date
+        
         base_playlist_name = get_s('playlist_name')
+        playlists_to_keep = get_s('playlists_to_keep')
         today_str = date.today().strftime('%Y-%m-%d')
         full_playlist_name = f"[{username}] {base_playlist_name} - {today_str}"
         
@@ -352,10 +392,59 @@ def create_private_playlist(username, canonical_ids):
         extauth_header = get_s('extauth_header')
         headers = {extauth_header: username}
         
-        # Subsonic createPlaylist requires an array of songId parameters
-        base_params = {'name': full_playlist_name}
-        song_ids_param = [('songId', tid) for tid in navidrome_ids]
+        # ============================================================
+        # STEP 1: Get existing playlists matching our pattern
+        # ============================================================
+        matching_playlists = get_matching_playlists(username, base_playlist_name)
         
+        # ============================================================
+        # STEP 2: Check if today's playlist already exists
+        # ============================================================
+        today_playlist_id = None
+        for pl in matching_playlists:
+            if pl['date_str'] == today_str:
+                today_playlist_id = pl['id']
+                break
+        
+        # ============================================================
+        # STEP 3: ROTATION - delete old playlists BEFORE creating new one
+        # ============================================================
+        playlists_to_delete = []
+        if today_playlist_id:
+            # Today's playlist already exists: keep it, delete extras beyond playlists_to_keep
+            # matching_playlists is sorted newest first; today's should be index 0
+            playlists_to_delete = matching_playlists[playlists_to_keep:]
+        else:
+            # Today's playlist doesn't exist yet: we'll create one,
+            # so keep only (playlists_to_keep - 1) existing ones to make room
+            playlists_to_delete = matching_playlists[playlists_to_keep - 1:]
+        
+        deleted_count = 0
+        for pl in playlists_to_delete:
+            try:
+                delete_data = nd_request('deletePlaylist', username, {'id': pl['id']})
+                if delete_data:
+                    deleted_count += 1
+                    logger.info(f"Deleted old playlist: {pl['name']} (ID: {pl['id']})")
+            except Exception as e:
+                logger.error(f"Failed to delete playlist {pl['name']}: {e}")
+        
+        if deleted_count > 0:
+            logger.info(f"Rotation for {username}: deleted {deleted_count} old playlist(s).")
+        
+        # ============================================================
+        # STEP 4: Create or update the playlist
+        # ============================================================
+        if today_playlist_id:
+            # Today's playlist already exists - UPDATE it using createPlaylist with playlistId
+            logger.info(f"Updating existing playlist '{full_playlist_name}' (ID: {today_playlist_id})")
+            base_params = {'playlistId': today_playlist_id, 'name': full_playlist_name}
+        else:
+            # Create brand new playlist
+            logger.info(f"Creating new playlist '{full_playlist_name}'")
+            base_params = {'name': full_playlist_name}
+        
+        song_ids_param = [('songId', tid) for tid in navidrome_ids]
         query = urlencode(base_params)
         song_query = urlencode(song_ids_param, doseq=True)
         full_url = f"{base_url_full}/rest/createPlaylist.view?{query}&{song_query}&v=1.16.1&c=AudioMusePlugin&f=json"
@@ -368,24 +457,22 @@ def create_private_playlist(username, canonical_ids):
         if not playlist_id:
             logger.error(f"Failed to parse playlist ID from createPlaylist for user {username}")
             return
-            
-        logger.info(f"Created playlist '{full_playlist_name}' (ID: {playlist_id}) for {username}")
         
-        # Make it private using Navidrome's updatePlaylist extension (public=false)
+        logger.info(f"Playlist '{full_playlist_name}' created/updated successfully (ID: {playlist_id})")
+        
+        # ============================================================
+        # STEP 5: Make it private
+        # ============================================================
         update_params = {'playlistId': playlist_id, 'public': 'false'}
         update_data = nd_request('updatePlaylist', username, update_params)
         if update_data:
-            logger.info(f"Successfully set playlist {playlist_id} to private for {username}")
+            logger.info(f"Set playlist {playlist_id} to private for {username}")
         
-        # Rotate playlists: keep only the last 3 for this user
-        rotate_user_playlists(username, base_playlist_name, today_str)
-            
     except Exception as e:
-        db.rollback()  # CRITICAL: reset transaction state after error
+        db.rollback()
         logger.exception(f"Failed to create/update playlist for {username}: {e}")
     finally:
         cur.close()
-
 
 def rotate_user_playlists(username, base_playlist_name, current_date_str):
     """
@@ -705,7 +792,6 @@ def settings():
         set_setting('extauth_header', request.form.get('extauth_header', DEFAULT_SETTINGS['extauth_header']))
         set_setting('playlist_name', request.form.get('playlist_name', DEFAULT_SETTINGS['playlist_name']))
         
-        # Safe integer parsing
         try: set_setting('max_tracks', int(request.form.get('max_tracks', DEFAULT_SETTINGS['max_tracks'])))
         except ValueError: pass
         try: set_setting('top_albums_to_fetch', int(request.form.get('top_albums_to_fetch', DEFAULT_SETTINGS['top_albums_to_fetch'])))
@@ -714,6 +800,8 @@ def settings():
         except ValueError: pass
         try: set_setting('num_neighbors', int(request.form.get('num_neighbors', DEFAULT_SETTINGS['num_neighbors'])))
         except ValueError: pass
+        try: set_setting('playlists_to_keep', int(request.form.get('playlists_to_keep', DEFAULT_SETTINGS['playlists_to_keep'])))
+        except ValueError: pass
         
         return redirect(manage_plugins_url())
 
@@ -721,16 +809,17 @@ def settings():
         '<form method="post">'
         '<h4>Navidrome Connection</h4>'
         f'<label>Navidrome URL:<br><input type="text" name="navidrome_url" value="{get_s("navidrome_url")}" style="width:100%;max-width:400px;"></label><br><br>'
-        f'<label>Admin Username (must have permissions to list all users):<br><input type="text" name="admin_username" value="{get_s("admin_username")}"></label><br><br>'
+        f'<label>Admin Username:<br><input type="text" name="admin_username" value="{get_s("admin_username")}"></label><br><br>'
         '<hr>'
         '<h4>ND_EXTAUTH & Playlist Settings</h4>'
-        f'<label>ND_EXTAUTH_USERHEADER Name (from Navidrome config):<br><input type="text" name="extauth_header" value="{get_s("extauth_header")}"></label><br><br>'
-        f'<label>Playlist Name:<br><input type="text" name="playlist_name" value="{get_s("playlist_name")}"></label><br><br>'
+        f'<label>ND_EXTAUTH_USERHEADER Name:<br><input type="text" name="extauth_header" value="{get_s("extauth_header")}"></label><br><br>'
+        f'<label>Playlist Name (base):<br><input type="text" name="playlist_name" value="{get_s("playlist_name")}"></label><br><br>'
         f'<label>Final Playlist Size (Max Tracks):<br><input type="number" name="max_tracks" value="{get_s("max_tracks")}" style="width:100px;"></label><br><br>'
+        f'<label>Playlists to Keep per User (rotation):<br><input type="number" name="playlists_to_keep" value="{get_s("playlists_to_keep")}" style="width:100px;" min="1" max="30"></label><br><br>'
         '<h4>Algorithm Tuning</h4>'
         f'<label>Frequent Albums to Scan per User:<br><input type="number" name="top_albums_to_fetch" value="{get_s("top_albums_to_fetch")}" style="width:100px;"></label><br><br>'
         f'<label>Seed Pool Size (Top Songs per User):<br><input type="number" name="top_songs_per_user" value="{get_s("top_songs_per_user")}" style="width:100px;"></label><br><br>'
-        f'<label>Number of Similar Neighbors to Fetch via IVF:<br><input type="number" name="num_neighbors" value="{get_s("num_neighbors")}" style="width:100px;"></label><br><br>'
+        f'<label>Number of Similar Neighbors via IVF:<br><input type="number" name="num_neighbors" value="{get_s("num_neighbors")}" style="width:100px;"></label><br><br>'
         '<button type="submit" class="btn btn-primary">Save Settings</button>'
         '</form>'
     )
