@@ -6,20 +6,20 @@
   "requirements": [],
   "versions": [
     {
+      "version": "0.0.2",
+      "min_core_version": "2.5.0",
+      "changelog": "Added manual run now",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/OldTyT/AudioMuse-AI-plugins/main/dist/batch_sonic_fp/batch_sonic_fp_0.0.2.zip",
+      "checksum": "1deddea97eb9d2ad5c7c5e0f75b59a22"
+    },
+    {
       "version": "0.0.1",
       "min_core_version": "2.5.0",
       "changelog": "First version",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/OldTyT/AudioMuse-AI-plugins/main/dist/batch_sonic_fp/batch_sonic_fp_0.0.1.zip",
       "checksum": "b9d7f84872ccfe33a55d28a164a978f7"
-    },
-    {
-      "version": "0.0.2",
-      "min_core_version": "2.5.0",
-      "changelog": "Added manual run now",
-      "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
     }
   ]
 }
