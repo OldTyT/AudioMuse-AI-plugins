@@ -359,13 +359,15 @@ def get_matching_playlists(username, base_playlist_name):
 
 
 def create_private_playlist(username, canonical_ids):
-    """
-    Creates or updates a dated playlist and rotates old ones.
-    Rotation happens BEFORE creation to avoid exceeding the limit.
-    """
+    """Creates or updates a dated playlist and rotates old ones."""
+    logger.info(f"[create_private_playlist] START - username={username}, tracks={len(canonical_ids)}")
+    
     server_id = get_server_id()
     if not server_id:
+        logger.error(f"[create_private_playlist] No server_id found for {username}")
         return
+    
+    logger.info(f"[create_private_playlist] Using server_id={server_id}")
     
     db = get_db()
     cur = db.cursor()
@@ -380,22 +382,29 @@ def create_private_playlist(username, canonical_ids):
         
         navidrome_ids = [reverse_map[cid] for cid in canonical_ids if cid in reverse_map]
         if not navidrome_ids:
-            logger.error(f"No valid provider IDs found to create playlist for user {username}.")
+            logger.error(f"[create_private_playlist] No valid provider IDs found for {username}")
             return
+        
+        logger.info(f"[create_private_playlist] Mapped to {len(navidrome_ids)} Navidrome IDs")
         
         base_playlist_name = get_s('playlist_name')
         playlists_to_keep = get_s('playlists_to_keep')
         today_str = date.today().strftime('%Y-%m-%d')
         full_playlist_name = f"[{username}] {base_playlist_name} - {today_str}"
         
-        base_url_full = get_s('navidrome_url').rstrip('/')
-        extauth_header = get_s('extauth_header')
-        headers = {extauth_header: username}
+        logger.info(f"[create_private_playlist] Playlist name: {full_playlist_name}")
+        logger.info(f"[create_private_playlist] playlists_to_keep: {playlists_to_keep}")
         
         # ============================================================
         # STEP 1: Get existing playlists matching our pattern
         # ============================================================
+        logger.info(f"[create_private_playlist] Fetching existing playlists for rotation...")
         matching_playlists = get_matching_playlists(username, base_playlist_name)
+        logger.info(f"[create_private_playlist] Found {len(matching_playlists)} matching playlists")
+        
+        for i, pl in enumerate(matching_playlists):
+            logger.debug(f"[create_private_playlist]   #{i}: {pl['name']} ({pl['date_str']})")
+
         
         # ============================================================
         # STEP 2: Check if today's playlist already exists
@@ -606,8 +615,6 @@ def create_private_playlist(username, canonical_ids):
 def run_batch_task():
     """Main entry point executed by the AudioMuse-AI Cron scheduler or RQ worker."""
     
-    # RQ workers operate outside the Flask application context.
-    # We must explicitly create it to access get_setting(), get_db(), etc.
     try:
         from flask_app import app
         ctx = app.app_context()
@@ -630,38 +637,50 @@ def run_batch_task():
         for user in users:
             try:
                 logger.info(f"Processing user: {user}")
+                
+                # STEP 1: Get top tracks
                 top_tracks = get_user_top_tracks(user)
                 if not top_tracks:
                     logger.warning(f"No top tracks found for user {user}. Skipping.")
                     continue
-                    
+                logger.info(f"[{user}] Found {len(top_tracks)} top tracks")
+                
+                # STEP 2: Compute fingerprint vector
                 result = compute_fingerprint_vector(user, top_tracks)
                 if not result:
                     logger.warning(f"Could not compute fingerprint vector for user {user}. Skipping.")
                     continue
-                    
-                average_vector, seed_ids = result
+                logger.info(f"[{user}] Computed fingerprint vector successfully")
                 
-                # Expand the seed pool using vector search
+                average_vector, seed_ids = result
+                logger.info(f"[{user}] Seed tracks: {len(seed_ids)}")
+                
+                # STEP 3: Find similar tracks
                 similar_tracks = get_similar_tracks(average_vector, num_neighbors)
                 similar_ids = [t['item_id'] for t in similar_tracks]
+                logger.info(f"[{user}] Found {len(similar_tracks)} similar tracks")
                 
-                # Combine seeds and neighbors, removing duplicates while preserving order
+                # STEP 4: Combine seeds and neighbors
                 final_ids = []
                 seen = set()
                 for cid in seed_ids + similar_ids:
                     if cid not in seen:
                         final_ids.append(cid)
                         seen.add(cid)
-                        
-                # Truncate to the final desired size
+                logger.info(f"[{user}] Combined unique tracks: {len(final_ids)}")
+                
+                # STEP 5: Truncate
                 final_ids = final_ids[:max_tracks]
+                logger.info(f"[{user}] Final track count after truncation: {len(final_ids)}")
                 
                 if not final_ids:
-                    logger.warning(f"No final tracks generated for user {user}.")
+                    logger.warning(f"[{user}] No final tracks generated. Skipping playlist creation.")
                     continue
-                    
+                
+                # STEP 6: Create playlist
+                logger.info(f"[{user}] Calling create_private_playlist with {len(final_ids)} tracks...")
                 create_private_playlist(user, final_ids)
+                logger.info(f"[{user}] create_private_playlist completed successfully")
                 
             except Exception as e:
                 logger.exception(f"Fatal error processing user {user}: {e}")
@@ -669,7 +688,6 @@ def run_batch_task():
         logger.info("=== Batch Sonic Fingerprint completed ===")
         
     finally:
-        # Clean up the application context to prevent memory leaks in the worker
         if ctx is not None:
             try:
                 ctx.pop()
