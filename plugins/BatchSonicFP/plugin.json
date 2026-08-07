@@ -10,8 +10,8 @@
       "min_core_version": "2.5.0",
       "changelog": "Added debug",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/OldTyT/AudioMuse-AI-plugins/main/dist/batch_sonic_fp/batch_sonic_fp_0.0.11.zip",
+      "checksum": "ad3c5c360fd948a7f3df38118e8d17b4"
     },
     {
       "version": "0.0.10",
