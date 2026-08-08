@@ -1,6 +1,7 @@
 import json
 import os
 import glob
+import time
 import requests
 from datetime import datetime
 
@@ -14,7 +15,6 @@ bp = Blueprint("smart_playlist_generator", __name__)
 # Navidrome Native API helpers
 # ---------------------------------------------------------------------------
 
-# Module-level cache for JWT token to avoid re-login on every request
 _jwt_token_cache = {"token": None, "expires": 0}
 
 
@@ -39,7 +39,6 @@ def _get_navidrome_creds():
     except Exception:
         pass
 
-    # Fallback: single-server / default config
     return {
         "url": (getattr(config, "NAVIDROME_URL", "") or "").rstrip("/"),
         "user": getattr(config, "NAVIDROME_USER", ""),
@@ -52,8 +51,6 @@ def _get_jwt_token():
     Authenticate with Navidrome Native API and get a JWT token.
     Token is cached for 5 minutes to avoid excessive logins.
     """
-    import time
-
     now = time.time()
     if _jwt_token_cache["token"] and _jwt_token_cache["expires"] > now:
         return _jwt_token_cache["token"]
@@ -76,7 +73,6 @@ def _get_jwt_token():
         if not token:
             logger.error("Navidrome login succeeded but no token in response")
             return None
-        # Cache for 5 minutes (tokens typically last longer)
         _jwt_token_cache["token"] = token
         _jwt_token_cache["expires"] = now + 300
         logger.debug("Navidrome JWT token acquired and cached")
@@ -86,7 +82,7 @@ def _get_jwt_token():
         return None
 
 
-def _native_api_request(endpoint, params=None, method="get"):
+def _native_api_request(endpoint, params=None, method="get", json_body=None):
     """
     Make a request to the Navidrome Native API using JWT authentication.
     Endpoint should NOT include /api/ prefix - it will be added automatically.
@@ -109,14 +105,16 @@ def _native_api_request(endpoint, params=None, method="get"):
             url,
             params=params,
             headers=headers,
+            json=json_body,
             timeout=30,
         )
         r.raise_for_status()
-        # Navidrome native API may return JSON array or object
+        # Some endpoints return empty body (e.g., DELETE, PATCH)
+        if r.status_code == 204 or not r.content:
+            return {"ok": True}
         return r.json()
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 401:
-            # Token expired - clear cache and retry once
             logger.warning("JWT token rejected, clearing cache and retrying login")
             _jwt_token_cache["token"] = None
             _jwt_token_cache["expires"] = 0
@@ -124,8 +122,12 @@ def _native_api_request(endpoint, params=None, method="get"):
             if token:
                 headers["X-Nd-Authorization"] = f"Bearer {token}"
                 try:
-                    r = requests.request(method, url, params=params, headers=headers, timeout=30)
+                    r = requests.request(
+                        method, url, params=params, headers=headers, json=json_body, timeout=30
+                    )
                     r.raise_for_status()
+                    if r.status_code == 204 or not r.content:
+                        return {"ok": True}
                     return r.json()
                 except Exception as retry_e:
                     logger.error(f"Navidrome API retry failed: {retry_e}")
@@ -146,8 +148,6 @@ def get_all_users():
     if data is None:
         return []
 
-    # Navidrome native API returns a JSON array of user objects
-    # Each user has: id, userName, name, email, isAdmin, etc.
     users = data if isinstance(data, list) else []
 
     return [
@@ -161,6 +161,130 @@ def get_all_users():
         for u in users
         if u.get("userName")
     ]
+
+
+def trigger_quick_scan():
+    """Trigger Navidrome Quick Scan to detect new/changed .nsp files."""
+    result = _native_api_request("scan/quick", method="post")
+    if result is not None:
+        logger.info("Navidrome Quick Scan triggered successfully")
+        return True
+    logger.error("Failed to trigger Navidrome Quick Scan")
+    return False
+
+
+def get_playlist_by_name(playlist_name):
+    """
+    Search for a playlist by exact name in Navidrome.
+    Returns the playlist dict if found, None otherwise.
+    """
+    data = _native_api_request(
+        "playlist",
+        params={
+            "_search": playlist_name,
+            "_sort": "name",
+            "_order": "ASC",
+            "_start": 0,
+            "_end": 50,
+        },
+    )
+    if data is None:
+        return None
+
+    playlists = data if isinstance(data, list) else []
+    for pl in playlists:
+        if pl.get("name") == playlist_name:
+            return pl
+    return None
+
+
+def set_playlist_owner(playlist_id, owner_user_id):
+    """
+    Change the owner of a playlist via Navidrome Native API.
+    PATCH /api/playlist/{playlistId}
+    """
+    result = _native_api_request(
+        f"playlist/{playlist_id}",
+        method="patch",
+        json_body={"owner_id": owner_user_id},
+    )
+    if result is not None:
+        logger.info(f"Set owner {owner_user_id} on playlist {playlist_id}")
+        return True
+    logger.error(f"Failed to set owner on playlist {playlist_id}")
+    return False
+
+
+def wait_and_assign_owners(users, playlist_configs, timeout=60, poll_interval=3):
+    """
+    After .nsp files are created and scan is triggered:
+    1. Poll Navidrome until the expected playlists appear.
+    2. Once found, change each playlist's owner to the corresponding user.
+    """
+    # Build expected playlist names: "{playlist_name} ({username})"
+    expected = []
+    for user in users:
+        username = user["username"]
+        user_id = user["id"]
+        for pl_config in playlist_configs:
+            pl_name = pl_config.get("name", "Smart Playlist")
+            full_name = f"{pl_name} ({username})"
+            expected.append({
+                "name": full_name,
+                "owner_id": user_id,
+                "username": username,
+            })
+
+    if not expected:
+        return {"assigned": 0, "not_found": [], "errors": []}
+
+    assigned = 0
+    not_found = []
+    errors = []
+
+    start_time = time.time()
+
+    # Poll until all playlists are found or timeout
+    pending = list(expected)
+    while pending and (time.time() - start_time) < timeout:
+        still_pending = []
+        for item in pending:
+            playlist = get_playlist_by_name(item["name"])
+            if playlist:
+                playlist_id = playlist.get("id")
+                if playlist_id:
+                    success = set_playlist_owner(playlist_id, item["owner_id"])
+                    if success:
+                        assigned += 1
+                        logger.info(
+                            f"Assigned owner '{item['username']}' to playlist '{item['name']}'"
+                        )
+                    else:
+                        errors.append(f"Failed to set owner for '{item['name']}'")
+                else:
+                    errors.append(f"Playlist '{item['name']}' found but has no id")
+            else:
+                still_pending.append(item)
+
+        pending = still_pending
+        if pending:
+            elapsed = int(time.time() - start_time)
+            logger.info(
+                f"Waiting for {len(pending)} playlist(s) to appear in Navidrome "
+                f"(elapsed: {elapsed}s, timeout: {timeout}s)"
+            )
+            time.sleep(poll_interval)
+
+    # Anything still pending after timeout
+    for item in pending:
+        not_found.append(item["name"])
+        logger.warning(f"Playlist '{item['name']}' not found in Navidrome after {timeout}s")
+
+    return {
+        "assigned": assigned,
+        "not_found": not_found,
+        "errors": errors,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +305,6 @@ def _build_nsp_content(playlist_name, rules, sort_field="dateadded", order="desc
         nsp["order"] = order
     if limit:
         nsp["limit"] = limit
-    # Private by default - each user owns their own playlist
     nsp["public"] = False
     return nsp
 
@@ -207,8 +330,12 @@ def _get_playlist_configs():
 
 def _generate_playlists():
     """
-    Main logic: get all users, generate .nsp files for each user,
-    remove stale .nsp files, and return a summary.
+    Main logic:
+    1. Get all users from Navidrome.
+    2. Generate .nsp files for each user x each playlist config.
+    3. Remove stale .nsp files.
+    4. Trigger Navidrome Quick Scan.
+    5. Wait for playlists to appear and assign owners.
     """
     output_dir = _get_output_dir()
     playlist_configs = _get_playlist_configs()
@@ -220,20 +347,21 @@ def _generate_playlists():
     users = get_all_users()
     if not users:
         logger.warning("No users found in Navidrome")
-        return {"created": 0, "deleted": 0, "users": 0, "error": "No users found (check admin credentials)"}
+        return {
+            "created": 0, "deleted": 0, "users": 0,
+            "error": "No users found (check admin credentials)",
+        }
 
     # Track which .nsp files we create in this run
     expected_files = set()
 
     created = 0
-    errors = []
+    file_errors = []
     for user in users:
         username = user["username"]
         for pl_config in playlist_configs:
             pl_name = pl_config.get("name", "Smart Playlist")
-            # Include username in the playlist name to differentiate per-user
             full_name = f"{pl_name} ({username})"
-            # File name: sanitized username + playlist name
             safe_username = "".join(
                 c if c.isalnum() or c in "-_ " else "_" for c in username
             )
@@ -262,10 +390,9 @@ def _generate_playlists():
             except Exception as e:
                 msg = f"Failed to write {filepath}: {e}"
                 logger.error(msg)
-                errors.append(msg)
+                file_errors.append(msg)
 
-    # Delete .nsp files in output_dir that were NOT created in this run
-    # (i.e., playlists removed from config or users removed from Navidrome)
+    # Delete stale .nsp files
     deleted = 0
     if os.path.isdir(output_dir):
         for existing_file in glob.glob(os.path.join(output_dir, "*.nsp")):
@@ -284,8 +411,40 @@ def _generate_playlists():
         "playlists_per_user": len(playlist_configs),
         "output_dir": output_dir,
     }
-    if errors:
-        result["errors"] = errors
+    if file_errors:
+        result["file_errors"] = file_errors
+
+    # --- Trigger Quick Scan ---
+    logger.info("Triggering Navidrome Quick Scan to detect new .nsp files...")
+    scan_ok = trigger_quick_scan()
+    result["scan_triggered"] = scan_ok
+
+    if not scan_ok:
+        result["error"] = "Failed to trigger Navidrome Quick Scan"
+        return result
+
+    # --- Wait for playlists to appear and assign owners ---
+    timeout = int(get_setting("scan_timeout", 60))
+    poll_interval = int(get_setting("poll_interval", 3))
+
+    logger.info(
+        f"Waiting up to {timeout}s for playlists to appear in Navidrome, "
+        f"then assigning owners..."
+    )
+    owner_result = wait_and_assign_owners(
+        users, playlist_configs, timeout=timeout, poll_interval=poll_interval
+    )
+    result["owners_assigned"] = owner_result["assigned"]
+    result["owners_not_found"] = owner_result["not_found"]
+    if owner_result["errors"]:
+        result["owner_errors"] = owner_result["errors"]
+
+    if owner_result["not_found"]:
+        logger.warning(
+            f"{len(owner_result['not_found'])} playlist(s) not found after scan: "
+            f"{owner_result['not_found'][:5]}..."
+        )
+
     return result
 
 
@@ -299,7 +458,8 @@ def generate_playlists_task():
     logger.info(
         f"Smart playlist generation complete: "
         f"{result['created']} created, {result['deleted']} deleted, "
-        f"{result['users']} users"
+        f"{result['users']} users, "
+        f"{result.get('owners_assigned', 0)} owners assigned"
     )
     return result
 
@@ -326,12 +486,14 @@ def home():
     body += f"<p><strong>Output directory:</strong> <code>{_get_output_dir()}</code></p>"
     body += f"<p><strong>Navidrome users found:</strong> {len(users)}</p>"
     body += f"<p><strong>Playlist configurations:</strong> {len(playlist_configs)}</p>"
+    body += f"<p><strong>Scan timeout:</strong> {get_setting('scan_timeout', 60)}s</p>"
+    body += f"<p><strong>Poll interval:</strong> {get_setting('poll_interval', 3)}s</p>"
 
     if users:
         body += "<h4>Users</h4><ul>"
         for u in users:
             admin_badge = " 👑" if u["is_admin"] else ""
-            body += f"<li>{u['username']}{admin_badge}</li>"
+            body += f"<li>{u['username']}{admin_badge} (id: {u['id'][:8]}...)</li>"
         body += "</ul>"
 
     if playlist_configs:
@@ -348,15 +510,28 @@ def home():
     # Last run results
     if last_run:
         body += "<h3>Last Run Results</h3>"
-        body += f"<p><strong>Created:</strong> {last_run.get('created', 0)} files</p>"
+        body += f"<p><strong>Created:</strong> {last_run.get('created', 0)} .nsp files</p>"
         body += f"<p><strong>Deleted (stale):</strong> {last_run.get('deleted', 0)} files</p>"
         body += f"<p><strong>Users processed:</strong> {last_run.get('users', 0)}</p>"
+        body += f"<p><strong>Scan triggered:</strong> {'✅' if last_run.get('scan_triggered') else '❌'}</p>"
+        body += f"<p><strong>Owners assigned:</strong> {last_run.get('owners_assigned', 0)}</p>"
         body += f"<p><strong>Time:</strong> {last_run.get('timestamp', 'unknown')}</p>"
+
         if last_run.get("error"):
-            body += f"<p><strong>Error:</strong> {last_run['error']}</p>"
-        if last_run.get("errors"):
-            body += "<p><strong>Errors:</strong></p><ul>"
-            for err in last_run["errors"]:
+            body += f"<p style='color:red;'><strong>Error:</strong> {last_run['error']}</p>"
+        if last_run.get("owners_not_found"):
+            body += "<p style='color:orange;'><strong>Playlists not found after scan:</strong></p><ul>"
+            for name in last_run["owners_not_found"][:10]:
+                body += f"<li>{name}</li>"
+            body += "</ul>"
+        if last_run.get("owner_errors"):
+            body += "<p style='color:red;'><strong>Owner assignment errors:</strong></p><ul>"
+            for err in last_run["owner_errors"][:10]:
+                body += f"<li>{err}</li>"
+            body += "</ul>"
+        if last_run.get("file_errors"):
+            body += "<p style='color:red;'><strong>File errors:</strong></p><ul>"
+            for err in last_run["file_errors"][:10]:
                 body += f"<li>{err}</li>"
             body += "</ul>"
 
@@ -386,12 +561,22 @@ def run_now():
 def settings():
     """Settings page for configuring playlists and output directory."""
     if request.method == "POST":
-        # Save output directory
         output_dir = request.form.get("output_dir", "").strip()
         if output_dir:
             set_setting("output_dir", output_dir)
 
-        # Parse playlist configurations from the form
+        try:
+            scan_timeout = int(request.form.get("scan_timeout", 60))
+            set_setting("scan_timeout", max(10, scan_timeout))
+        except (ValueError, TypeError):
+            pass
+
+        try:
+            poll_interval = int(request.form.get("poll_interval", 3))
+            set_setting("poll_interval", max(1, poll_interval))
+        except (ValueError, TypeError):
+            pass
+
         playlist_configs = []
         playlist_count = int(request.form.get("playlist_count", 0))
 
@@ -430,9 +615,11 @@ def settings():
         set_setting("playlists", playlist_configs)
         return redirect(manage_plugins_url())
 
-    # GET: render the settings form
+    # GET
     output_dir = _get_output_dir()
     playlist_configs = _get_playlist_configs()
+    scan_timeout = get_setting("scan_timeout", 60)
+    poll_interval = get_setting("poll_interval", 3)
 
     body = '<div style="max-width:900px;">'
     body += (
@@ -443,6 +630,20 @@ def settings():
         '<code>PlaylistsPath</code>).</p>'
         f'<input type="text" name="output_dir" value="{output_dir}" '
         'style="width:100%;padding:.5rem;margin-bottom:1rem;">'
+    )
+
+    body += "<h3>Scan Settings</h3>"
+    body += (
+        '<label style="display:block;margin-bottom:.5rem;">'
+        'Scan timeout (seconds, how long to wait for playlists to appear): '
+        f'<input type="number" name="scan_timeout" value="{scan_timeout}" '
+        'min="10" max="300" style="width:80px;padding:.3rem;">'
+        '</label>'
+        '<label style="display:block;margin-bottom:1rem;">'
+        'Poll interval (seconds, how often to check): '
+        f'<input type="number" name="poll_interval" value="{poll_interval}" '
+        'min="1" max="30" style="width:80px;padding:.3rem;">'
+        '</label>'
     )
 
     body += "<h3>Playlists</h3>"
@@ -472,7 +673,6 @@ def settings():
 
     body += "</form>"
 
-    # JavaScript for dynamic playlist add/remove
     body += """
     <script>
     let playlistIndex = %d;
