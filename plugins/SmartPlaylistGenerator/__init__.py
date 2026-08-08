@@ -2,6 +2,7 @@ import json
 import os
 import glob
 import requests
+from datetime import datetime
 
 from flask import Blueprint, request, redirect
 
@@ -10,8 +11,12 @@ from plugin.api import get_setting, set_setting, render_page, manage_plugins_url
 bp = Blueprint("smart_playlist_generator", __name__)
 
 # ---------------------------------------------------------------------------
-# Navidrome Subsonic API helpers
+# Navidrome Native API helpers
 # ---------------------------------------------------------------------------
+
+# Module-level cache for JWT token to avoid re-login on every request
+_jwt_token_cache = {"token": None, "expires": 0}
+
 
 def _get_navidrome_creds():
     """
@@ -42,54 +47,119 @@ def _get_navidrome_creds():
     }
 
 
-def _api_request(endpoint, params=None, method="get"):
-    """Make a request to the Navidrome Subsonic API."""
+def _get_jwt_token():
+    """
+    Authenticate with Navidrome Native API and get a JWT token.
+    Token is cached for 5 minutes to avoid excessive logins.
+    """
+    import time
+
+    now = time.time()
+    if _jwt_token_cache["token"] and _jwt_token_cache["expires"] > now:
+        return _jwt_token_cache["token"]
+
     creds = _get_navidrome_creds()
     if not creds["url"] or not creds["user"] or not creds["password"]:
         logger.error("Navidrome credentials not configured")
         return None
 
-    url = f"{creds['url']}/rest/{endpoint}.view"
-    auth_params = {
-        "u": creds["user"],
-        "p": f"enc:{creds['password'].encode('utf-8').hex()}",
-        "v": "1.16.1",
-        "c": "AudioMuse-AI-SmartPlaylistGenerator",
-        "f": "json",
+    login_url = f"{creds['url']}/auth/login"
+    try:
+        r = requests.post(
+            login_url,
+            json={"username": creds["user"], "password": creds["password"]},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        token = data.get("token")
+        if not token:
+            logger.error("Navidrome login succeeded but no token in response")
+            return None
+        # Cache for 5 minutes (tokens typically last longer)
+        _jwt_token_cache["token"] = token
+        _jwt_token_cache["expires"] = now + 300
+        logger.debug("Navidrome JWT token acquired and cached")
+        return token
+    except Exception as e:
+        logger.error(f"Navidrome login failed: {e}")
+        return None
+
+
+def _native_api_request(endpoint, params=None, method="get"):
+    """
+    Make a request to the Navidrome Native API using JWT authentication.
+    Endpoint should NOT include /api/ prefix - it will be added automatically.
+    """
+    token = _get_jwt_token()
+    if not token:
+        return None
+
+    creds = _get_navidrome_creds()
+    url = f"{creds['url']}/api/{endpoint.lstrip('/')}"
+
+    headers = {
+        "X-Nd-Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
     }
-    all_params = {**auth_params, **(params or {})}
 
     try:
-        r = requests.request(method, url, params=all_params, timeout=30)
+        r = requests.request(
+            method,
+            url,
+            params=params,
+            headers=headers,
+            timeout=30,
+        )
         r.raise_for_status()
-        data = r.json().get("subsonic-response", {})
-        if data.get("status") == "failed":
-            err = data.get("error", {})
-            logger.error(f"Navidrome API error on {endpoint}: {err.get('message')}")
+        # Navidrome native API may return JSON array or object
+        return r.json()
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 401:
+            # Token expired - clear cache and retry once
+            logger.warning("JWT token rejected, clearing cache and retrying login")
+            _jwt_token_cache["token"] = None
+            _jwt_token_cache["expires"] = 0
+            token = _get_jwt_token()
+            if token:
+                headers["X-Nd-Authorization"] = f"Bearer {token}"
+                try:
+                    r = requests.request(method, url, params=params, headers=headers, timeout=30)
+                    r.raise_for_status()
+                    return r.json()
+                except Exception as retry_e:
+                    logger.error(f"Navidrome API retry failed: {retry_e}")
             return None
-        return data
+        logger.error(f"Navidrome API HTTP error on {endpoint}: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Navidrome API request failed: {e}")
+        logger.error(f"Navidrome API request failed on {endpoint}: {e}")
         return None
 
 
 def get_all_users():
-    """Fetch all users from Navidrome via Subsonic getUsers endpoint."""
-    data = _api_request("getUsers")
-    if not data:
+    """
+    Fetch all users from Navidrome via Native API endpoint /api/user.
+    Requires admin privileges. Returns list of user dicts.
+    """
+    data = _native_api_request("user")
+    if data is None:
         return []
-    users_data = data.get("users", {})
-    users = users_data.get("user", [])
-    if isinstance(users, dict):
-        users = [users]
+
+    # Navidrome native API returns a JSON array of user objects
+    # Each user has: id, userName, name, email, isAdmin, etc.
+    users = data if isinstance(data, list) else []
+
     return [
         {
-            "username": u.get("username"),
-            "id": u.get("id"),
-            "is_admin": u.get("adminRole", False),
+            "username": u.get("userName", ""),
+            "id": u.get("id", ""),
+            "name": u.get("name", ""),
+            "email": u.get("email", ""),
+            "is_admin": u.get("isAdmin", False),
         }
         for u in users
-        if u.get("username")
+        if u.get("userName")
     ]
 
 
@@ -125,8 +195,6 @@ def _write_nsp_file(filepath, nsp_content):
 
 def _get_output_dir():
     """Get the configured output directory for .nsp files."""
-    # Use APP_DATA_DIR if available (the correct variable in AudioMuse-AI),
-    # fall back to /data which is the standard Navidrome data volume path.
     app_data = getattr(config, "APP_DATA_DIR", None) or "/data"
     default_path = os.path.join(app_data, "smart-playlists")
     return get_setting("output_dir", default_path)
@@ -152,12 +220,13 @@ def _generate_playlists():
     users = get_all_users()
     if not users:
         logger.warning("No users found in Navidrome")
-        return {"created": 0, "deleted": 0, "users": 0, "error": "No users found"}
+        return {"created": 0, "deleted": 0, "users": 0, "error": "No users found (check admin credentials)"}
 
     # Track which .nsp files we create in this run
     expected_files = set()
 
     created = 0
+    errors = []
     for user in users:
         username = user["username"]
         for pl_config in playlist_configs:
@@ -191,7 +260,9 @@ def _generate_playlists():
                 created += 1
                 logger.info(f"Created .nsp file: {filepath}")
             except Exception as e:
-                logger.error(f"Failed to write {filepath}: {e}")
+                msg = f"Failed to write {filepath}: {e}"
+                logger.error(msg)
+                errors.append(msg)
 
     # Delete .nsp files in output_dir that were NOT created in this run
     # (i.e., playlists removed from config or users removed from Navidrome)
@@ -206,13 +277,16 @@ def _generate_playlists():
                 except Exception as e:
                     logger.error(f"Failed to delete {existing_file}: {e}")
 
-    return {
+    result = {
         "created": created,
         "deleted": deleted,
         "users": len(users),
         "playlists_per_user": len(playlist_configs),
         "output_dir": output_dir,
     }
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +354,11 @@ def home():
         body += f"<p><strong>Time:</strong> {last_run.get('timestamp', 'unknown')}</p>"
         if last_run.get("error"):
             body += f"<p><strong>Error:</strong> {last_run['error']}</p>"
+        if last_run.get("errors"):
+            body += "<p><strong>Errors:</strong></p><ul>"
+            for err in last_run["errors"]:
+                body += f"<li>{err}</li>"
+            body += "</ul>"
 
     # Manual run button
     body += (
@@ -297,8 +376,6 @@ def home():
 @bp.route("/run", methods=["POST"])
 def run_now():
     """Manual trigger: generate playlists immediately."""
-    from datetime import datetime
-
     result = _generate_playlists()
     result["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     set_setting("last_run", result)
