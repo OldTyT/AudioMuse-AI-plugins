@@ -19,11 +19,7 @@ _jwt_token_cache = {"token": None, "expires": 0}
 
 
 def _get_navidrome_creds():
-    """
-    Get Navidrome connection details.
-    Tries the active server context first (multi-server support),
-    then falls back to the global config (single-server / default).
-    """
+    """Get Navidrome connection details from active server or global config."""
     try:
         from plugin.api import active_server_id, list_servers
         server_id = active_server_id()
@@ -47,7 +43,7 @@ def _get_navidrome_creds():
 
 
 # ---------------------------------------------------------------------------
-# Subsonic API (used for startScan)
+# Subsonic API (for startScan)
 # ---------------------------------------------------------------------------
 
 def _subsonic_auth_params():
@@ -90,15 +86,12 @@ def _subsonic_request(endpoint, params=None, method="get"):
 
 
 def trigger_quick_scan():
-    """
-    Trigger Navidrome scan via Subsonic API: POST /rest/startScan.view
-    Navidrome will pick up new/changed .nsp files during the scan.
-    """
+    """Trigger Navidrome scan via Subsonic API: POST /rest/startScan.view"""
     data = _subsonic_request("startScan", method="post")
     if data is not None:
         scan_info = data.get("scanStatus", {})
         logger.info(
-            f"Navidrome scan triggered. Status: {scan_info.get('scanning', '?')}, "
+            f"Navidrome scan triggered. Scanning: {scan_info.get('scanning', '?')}, "
             f"count: {scan_info.get('count', '?')}"
         )
         return True
@@ -107,14 +100,11 @@ def trigger_quick_scan():
 
 
 # ---------------------------------------------------------------------------
-# Native API (used for users, playlists, owner assignment)
+# Native API (for users, playlists, owner assignment)
 # ---------------------------------------------------------------------------
 
 def _get_jwt_token():
-    """
-    Authenticate with Navidrome Native API and get a JWT token.
-    Token is cached for 5 minutes to avoid excessive logins.
-    """
+    """Authenticate with Navidrome Native API and get a JWT token."""
     now = time.time()
     if _jwt_token_cache["token"] and _jwt_token_cache["expires"] > now:
         return _jwt_token_cache["token"]
@@ -195,10 +185,7 @@ def _native_api_request(endpoint, params=None, method="get", json_body=None):
 
 
 def get_all_users():
-    """
-    Fetch all users from Navidrome via Native API endpoint /api/user.
-    Requires admin privileges.
-    """
+    """Fetch all users from Navidrome via Native API GET /api/user."""
     data = _native_api_request("user")
     if data is None:
         return []
@@ -219,14 +206,11 @@ def get_all_users():
 
 
 def get_playlist_by_name(playlist_name):
-    """
-    Search for a playlist by exact name in Navidrome.
-    Returns the playlist dict if found, None otherwise.
-    """
+    """Search for a playlist by exact name in Navidrome."""
     data = _native_api_request(
         "playlist",
         params={
-            "_search": playlist_name,
+            "name": playlist_name,
             "_sort": "name",
             "_order": "ASC",
             "_start": 0,
@@ -246,13 +230,25 @@ def get_playlist_by_name(playlist_name):
 def set_playlist_owner(playlist_id, owner_user_id):
     """
     Change the owner of a playlist via Navidrome Native API.
-    PATCH /api/playlist/{playlistId} with ownerId field.
+    Uses PUT /api/playlist/{playlistId} (NOT PATCH - Navidrome only supports PUT).
+    
+    PUT requires the full playlist object. We first GET the playlist,
+    then PUT it back with the updated ownerId.
     """
-    # Navidrome uses ownerId (camelCase) in its native API
+    # First, get the current playlist data
+    playlist_data = _native_api_request(f"playlist/{playlist_id}", method="get")
+    if playlist_data is None or not isinstance(playlist_data, dict):
+        logger.error(f"Failed to fetch playlist {playlist_id} for owner update")
+        return False
+
+    # Update the ownerId field
+    playlist_data["ownerId"] = owner_user_id
+
+    # PUT the full playlist object back
     result = _native_api_request(
         f"playlist/{playlist_id}",
-        method="patch",
-        json_body={"ownerId": owner_user_id},
+        method="put",
+        json_body=playlist_data,
     )
     if result is not None:
         logger.info(f"Set owner {owner_user_id} on playlist {playlist_id}")
@@ -267,15 +263,12 @@ def wait_and_assign_owners(users, playlist_configs, timeout=60, poll_interval=3)
     1. Poll Navidrome until the expected playlists appear.
     2. Once found, change each playlist's owner to the corresponding user.
     """
-    # Build expected playlist names (no username in name anymore)
     expected = []
     for user in users:
         username = user["username"]
         user_id = user["id"]
         for pl_config in playlist_configs:
             pl_name = pl_config.get("name", "Smart Playlist")
-            # The .nsp "name" field is just pl_name (no username suffix)
-            # but we still match by exact name in Navidrome
             expected.append({
                 "name": pl_name,
                 "owner_id": user_id,
@@ -299,7 +292,6 @@ def wait_and_assign_owners(users, playlist_configs, timeout=60, poll_interval=3)
             if playlist:
                 playlist_id = playlist.get("id")
                 if playlist_id:
-                    # Only change owner if it's not already this user
                     current_owner = playlist.get("ownerId") or playlist.get("owner_id")
                     if current_owner == item["owner_id"]:
                         assigned += 1
@@ -348,14 +340,10 @@ def wait_and_assign_owners(users, playlist_configs, timeout=60, poll_interval=3)
 def _build_nsp_content(playlist_name, description, raw_json_str):
     """
     Build the JSON content for a .nsp file.
-
-    If raw_json_str is provided and valid JSON, parse it and use it as the
-    base. Then always inject/override "name" and optionally "comment".
-    If raw_json_str is empty or invalid, create a minimal empty playlist.
+    Parses user-provided raw JSON and injects/overrides name, comment, public.
     """
     nsp = {}
 
-    # Try to parse user-provided raw JSON
     if raw_json_str and raw_json_str.strip():
         try:
             parsed = json.loads(raw_json_str)
@@ -372,14 +360,11 @@ def _build_nsp_content(playlist_name, description, raw_json_str):
                 f"Falling back to empty playlist."
             )
 
-    # Always set name (no username suffix in .nsp content)
     nsp["name"] = playlist_name
 
-    # Set comment if description is provided
     if description and description.strip():
         nsp["comment"] = description
 
-    # Ensure public is False (private per-user playlist)
     nsp["public"] = False
 
     return nsp
@@ -409,12 +394,9 @@ def _generate_playlists():
     Main logic:
     1. Get all users from Navidrome.
     2. Generate .nsp files for each user x each playlist config.
-       File name includes username for uniqueness, but .nsp "name" field
-       does NOT include username (so each user gets a playlist with the
-       same display name, just different owner).
     3. Remove stale .nsp files.
     4. Trigger Navidrome scan via Subsonic startScan.
-    5. Wait for playlists to appear and assign owners via Native API.
+    5. Wait for playlists to appear and assign owners via Native API PUT.
     """
     output_dir = _get_output_dir()
     playlist_configs = _get_playlist_configs()
@@ -431,7 +413,6 @@ def _generate_playlists():
             "error": "No users found (check admin credentials)",
         }
 
-    # Track which .nsp files we create in this run
     expected_files = set()
 
     created = 0
@@ -443,7 +424,6 @@ def _generate_playlists():
             description = pl_config.get("description", "")
             raw_json_str = pl_config.get("raw_json", "")
 
-            # File name includes username for filesystem uniqueness
             safe_username = "".join(
                 c if c.isalnum() or c in "-_ " else "_" for c in username
             )
@@ -465,7 +445,6 @@ def _generate_playlists():
                 logger.error(msg)
                 file_errors.append(msg)
 
-    # Delete stale .nsp files
     deleted = 0
     if os.path.isdir(output_dir):
         for existing_file in glob.glob(os.path.join(output_dir, "*.nsp")):
@@ -487,7 +466,6 @@ def _generate_playlists():
     if file_errors:
         result["file_errors"] = file_errors
 
-    # --- Trigger Navidrome Scan ---
     logger.info("Triggering Navidrome scan via /rest/startScan to detect new .nsp files...")
     scan_ok = trigger_quick_scan()
     result["scan_triggered"] = scan_ok
@@ -496,7 +474,6 @@ def _generate_playlists():
         result["error"] = "Failed to trigger Navidrome scan"
         return result
 
-    # --- Wait for playlists to appear and assign owners ---
     timeout = int(get_setting("scan_timeout", 60))
     poll_interval = int(get_setting("poll_interval", 3))
 
@@ -659,7 +636,6 @@ def settings():
             description = request.form.get(f"pl_{i}_description", "").strip()
             raw_json = request.form.get(f"pl_{i}_raw_json", "")
 
-            # Validate raw_json if provided
             if raw_json.strip():
                 try:
                     parsed = json.loads(raw_json)
@@ -680,7 +656,6 @@ def settings():
         set_setting("playlists", playlist_configs)
         return redirect(manage_plugins_url())
 
-    # GET
     output_dir = _get_output_dir()
     playlist_configs = _get_playlist_configs()
     scan_timeout = get_setting("scan_timeout", 60)
