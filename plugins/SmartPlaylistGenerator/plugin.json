@@ -10,8 +10,8 @@
       "min_core_version": "2.5.0",
       "changelog": "Update navidrome nsp",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/OldTyT/AudioMuse-AI-plugins/main/dist/smart_playlist_generator/smart_playlist_generator_0.0.4.zip",
+      "checksum": "2e1c46230d5552c2d745be56f6d2357f"
     },
     {
       "version": "0.0.3",
