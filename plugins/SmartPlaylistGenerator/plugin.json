@@ -10,8 +10,8 @@
       "min_core_version": "2.5.0",
       "changelog": "Fix navidrome API",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/OldTyT/AudioMuse-AI-plugins/main/dist/smart_playlist_generator/smart_playlist_generator_0.0.6.zip",
+      "checksum": "a3eb1b459886b2e612c7fe8397b57231"
     },
     {
       "version": "0.0.5",
