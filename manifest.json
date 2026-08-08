@@ -6,6 +6,13 @@
       "author": "OldTyT",
       "description": "Create playlist for every user.",
       "pluginUrl": "https://raw.githubusercontent.com/OldTyT/AudioMuse-AI-plugins/main/plugins/BatchSonicFP/plugin.json"
+    },
+    {
+      "id": "smart_playlist_generator",
+      "name": "SmartPlaylistGenerator",
+      "author": "OldTyT",
+      "description": "Generates Navidrome smart playlists (.nsp) for each user with configurable rules. Supports cron scheduling and manual execution.",
+      "pluginUrl": "https://raw.githubusercontent.com/OldTyT/AudioMuse-AI-plugins/main/plugins/SmartPlaylistGenerator/plugin.json"
     }
   ]
 }

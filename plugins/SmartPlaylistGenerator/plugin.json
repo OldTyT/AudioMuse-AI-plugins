@@ -1,0 +1,17 @@
+{
+  "id": "smart_playlist_generator",
+  "name": "Smart Playlist Generator",
+  "author": "OldTyT",
+  "description": "Generates Navidrome smart playlists (.nsp) for each user with configurable rules. Supports cron scheduling and manual execution.",
+  "requirements": [],
+  "versions": [
+    {
+      "version": "0.0.1",
+      "min_core_version": "2.5.0",
+      "changelog": "Initial release: create per-user smart playlists via admin API.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    }
+  ]
+}
