@@ -12,7 +12,7 @@ from plugin.api import get_setting, set_setting, render_page, manage_plugins_url
 bp = Blueprint("smart_playlist_generator", __name__)
 
 # ---------------------------------------------------------------------------
-# Navidrome Native API helpers
+# Navidrome credentials
 # ---------------------------------------------------------------------------
 
 _jwt_token_cache = {"token": None, "expires": 0}
@@ -45,6 +45,70 @@ def _get_navidrome_creds():
         "password": getattr(config, "NAVIDROME_PASSWORD", ""),
     }
 
+
+# ---------------------------------------------------------------------------
+# Subsonic API (used for startScan)
+# ---------------------------------------------------------------------------
+
+def _subsonic_auth_params():
+    """Build Subsonic auth dict from current credentials."""
+    creds = _get_navidrome_creds()
+    if not creds["user"] or not creds["password"]:
+        return None
+    return {
+        "u": creds["user"],
+        "p": f"enc:{creds['password'].encode('utf-8').hex()}",
+        "v": "1.16.1",
+        "c": "AudioMuse-AI-SmartPlaylistGenerator",
+        "f": "json",
+    }
+
+
+def _subsonic_request(endpoint, params=None, method="get"):
+    """Make a request to the Navidrome Subsonic API."""
+    auth = _subsonic_auth_params()
+    if not auth:
+        logger.error("Navidrome credentials not configured")
+        return None
+
+    creds = _get_navidrome_creds()
+    url = f"{creds['url']}/rest/{endpoint}.view"
+    all_params = {**auth, **(params or {})}
+
+    try:
+        r = requests.request(method, url, params=all_params, timeout=30)
+        r.raise_for_status()
+        data = r.json().get("subsonic-response", {})
+        if data.get("status") == "failed":
+            err = data.get("error", {})
+            logger.error(f"Navidrome Subsonic API error on {endpoint}: {err.get('message')}")
+            return None
+        return data
+    except Exception as e:
+        logger.error(f"Navidrome Subsonic API request failed on {endpoint}: {e}")
+        return None
+
+
+def trigger_quick_scan():
+    """
+    Trigger Navidrome scan via Subsonic API: POST /rest/startScan.view
+    Navidrome will pick up new/changed .nsp files during the scan.
+    """
+    data = _subsonic_request("startScan", method="post")
+    if data is not None:
+        scan_info = data.get("scanStatus", {})
+        logger.info(
+            f"Navidrome scan triggered. Status: {scan_info.get('scanning', '?')}, "
+            f"count: {scan_info.get('count', '?')}"
+        )
+        return True
+    logger.error("Failed to trigger Navidrome scan via startScan")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Native API (used for users, playlists, owner assignment)
+# ---------------------------------------------------------------------------
 
 def _get_jwt_token():
     """
@@ -99,36 +163,27 @@ def _native_api_request(endpoint, params=None, method="get", json_body=None):
         "Content-Type": "application/json",
     }
 
-    try:
+    def _do_request(tk):
+        hdrs = {**headers, "X-Nd-Authorization": f"Bearer {tk}"}
         r = requests.request(
-            method,
-            url,
-            params=params,
-            headers=headers,
-            json=json_body,
-            timeout=30,
+            method, url, params=params, headers=hdrs, json=json_body, timeout=30
         )
         r.raise_for_status()
-        # Some endpoints return empty body (e.g., DELETE, PATCH)
         if r.status_code == 204 or not r.content:
             return {"ok": True}
         return r.json()
+
+    try:
+        return _do_request(token)
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 401:
             logger.warning("JWT token rejected, clearing cache and retrying login")
             _jwt_token_cache["token"] = None
             _jwt_token_cache["expires"] = 0
-            token = _get_jwt_token()
-            if token:
-                headers["X-Nd-Authorization"] = f"Bearer {token}"
+            new_token = _get_jwt_token()
+            if new_token:
                 try:
-                    r = requests.request(
-                        method, url, params=params, headers=headers, json=json_body, timeout=30
-                    )
-                    r.raise_for_status()
-                    if r.status_code == 204 or not r.content:
-                        return {"ok": True}
-                    return r.json()
+                    return _do_request(new_token)
                 except Exception as retry_e:
                     logger.error(f"Navidrome API retry failed: {retry_e}")
             return None
@@ -142,7 +197,7 @@ def _native_api_request(endpoint, params=None, method="get", json_body=None):
 def get_all_users():
     """
     Fetch all users from Navidrome via Native API endpoint /api/user.
-    Requires admin privileges. Returns list of user dicts.
+    Requires admin privileges.
     """
     data = _native_api_request("user")
     if data is None:
@@ -161,16 +216,6 @@ def get_all_users():
         for u in users
         if u.get("userName")
     ]
-
-
-def trigger_quick_scan():
-    """Trigger Navidrome Quick Scan to detect new/changed .nsp files."""
-    result = _native_api_request("scan/quick", method="post")
-    if result is not None:
-        logger.info("Navidrome Quick Scan triggered successfully")
-        return True
-    logger.error("Failed to trigger Navidrome Quick Scan")
-    return False
 
 
 def get_playlist_by_name(playlist_name):
@@ -201,12 +246,13 @@ def get_playlist_by_name(playlist_name):
 def set_playlist_owner(playlist_id, owner_user_id):
     """
     Change the owner of a playlist via Navidrome Native API.
-    PATCH /api/playlist/{playlistId}
+    PATCH /api/playlist/{playlistId} with ownerId field.
     """
+    # Navidrome uses ownerId (camelCase) in its native API
     result = _native_api_request(
         f"playlist/{playlist_id}",
         method="patch",
-        json_body={"owner_id": owner_user_id},
+        json_body={"ownerId": owner_user_id},
     )
     if result is not None:
         logger.info(f"Set owner {owner_user_id} on playlist {playlist_id}")
@@ -221,16 +267,17 @@ def wait_and_assign_owners(users, playlist_configs, timeout=60, poll_interval=3)
     1. Poll Navidrome until the expected playlists appear.
     2. Once found, change each playlist's owner to the corresponding user.
     """
-    # Build expected playlist names: "{playlist_name} ({username})"
+    # Build expected playlist names (no username in name anymore)
     expected = []
     for user in users:
         username = user["username"]
         user_id = user["id"]
         for pl_config in playlist_configs:
             pl_name = pl_config.get("name", "Smart Playlist")
-            full_name = f"{pl_name} ({username})"
+            # The .nsp "name" field is just pl_name (no username suffix)
+            # but we still match by exact name in Navidrome
             expected.append({
-                "name": full_name,
+                "name": pl_name,
                 "owner_id": user_id,
                 "username": username,
             })
@@ -243,9 +290,8 @@ def wait_and_assign_owners(users, playlist_configs, timeout=60, poll_interval=3)
     errors = []
 
     start_time = time.time()
-
-    # Poll until all playlists are found or timeout
     pending = list(expected)
+
     while pending and (time.time() - start_time) < timeout:
         still_pending = []
         for item in pending:
@@ -253,8 +299,14 @@ def wait_and_assign_owners(users, playlist_configs, timeout=60, poll_interval=3)
             if playlist:
                 playlist_id = playlist.get("id")
                 if playlist_id:
-                    success = set_playlist_owner(playlist_id, item["owner_id"])
-                    if success:
+                    # Only change owner if it's not already this user
+                    current_owner = playlist.get("ownerId") or playlist.get("owner_id")
+                    if current_owner == item["owner_id"]:
+                        assigned += 1
+                        logger.debug(
+                            f"Playlist '{item['name']}' already owned by '{item['username']}'"
+                        )
+                    elif set_playlist_owner(playlist_id, item["owner_id"]):
                         assigned += 1
                         logger.info(
                             f"Assigned owner '{item['username']}' to playlist '{item['name']}'"
@@ -275,10 +327,12 @@ def wait_and_assign_owners(users, playlist_configs, timeout=60, poll_interval=3)
             )
             time.sleep(poll_interval)
 
-    # Anything still pending after timeout
     for item in pending:
         not_found.append(item["name"])
-        logger.warning(f"Playlist '{item['name']}' not found in Navidrome after {timeout}s")
+        logger.warning(
+            f"Playlist '{item['name']}' (owner: {item['username']}) "
+            f"not found in Navidrome after {timeout}s"
+        )
 
     return {
         "assigned": assigned,
@@ -291,21 +345,43 @@ def wait_and_assign_owners(users, playlist_configs, timeout=60, poll_interval=3)
 # .nsp file generation
 # ---------------------------------------------------------------------------
 
-def _build_nsp_content(playlist_name, rules, sort_field="dateadded", order="desc", limit=100):
-    """Build the JSON content for a .nsp file."""
-    nsp = {
-        "name": playlist_name,
-        "all": rules.get("all", []),
-    }
-    if rules.get("any"):
-        nsp["any"] = rules["any"]
-    if sort_field:
-        nsp["sort"] = sort_field
-    if order:
-        nsp["order"] = order
-    if limit:
-        nsp["limit"] = limit
+def _build_nsp_content(playlist_name, description, raw_json_str):
+    """
+    Build the JSON content for a .nsp file.
+
+    If raw_json_str is provided and valid JSON, parse it and use it as the
+    base. Then always inject/override "name" and optionally "comment".
+    If raw_json_str is empty or invalid, create a minimal empty playlist.
+    """
+    nsp = {}
+
+    # Try to parse user-provided raw JSON
+    if raw_json_str and raw_json_str.strip():
+        try:
+            parsed = json.loads(raw_json_str)
+            if isinstance(parsed, dict):
+                nsp = parsed
+            else:
+                logger.warning(
+                    f"Raw JSON for playlist '{playlist_name}' is not a dict, "
+                    f"falling back to empty playlist"
+                )
+        except json.JSONDecodeError as e:
+            logger.warning(
+                f"Invalid JSON for playlist '{playlist_name}': {e}. "
+                f"Falling back to empty playlist."
+            )
+
+    # Always set name (no username suffix in .nsp content)
+    nsp["name"] = playlist_name
+
+    # Set comment if description is provided
+    if description and description.strip():
+        nsp["comment"] = description
+
+    # Ensure public is False (private per-user playlist)
     nsp["public"] = False
+
     return nsp
 
 
@@ -333,9 +409,12 @@ def _generate_playlists():
     Main logic:
     1. Get all users from Navidrome.
     2. Generate .nsp files for each user x each playlist config.
+       File name includes username for uniqueness, but .nsp "name" field
+       does NOT include username (so each user gets a playlist with the
+       same display name, just different owner).
     3. Remove stale .nsp files.
-    4. Trigger Navidrome Quick Scan.
-    5. Wait for playlists to appear and assign owners.
+    4. Trigger Navidrome scan via Subsonic startScan.
+    5. Wait for playlists to appear and assign owners via Native API.
     """
     output_dir = _get_output_dir()
     playlist_configs = _get_playlist_configs()
@@ -361,7 +440,10 @@ def _generate_playlists():
         username = user["username"]
         for pl_config in playlist_configs:
             pl_name = pl_config.get("name", "Smart Playlist")
-            full_name = f"{pl_name} ({username})"
+            description = pl_config.get("description", "")
+            raw_json_str = pl_config.get("raw_json", "")
+
+            # File name includes username for filesystem uniqueness
             safe_username = "".join(
                 c if c.isalnum() or c in "-_ " else "_" for c in username
             )
@@ -372,17 +454,8 @@ def _generate_playlists():
             filepath = os.path.join(output_dir, filename)
             expected_files.add(filepath)
 
-            rules = {
-                "all": pl_config.get("all_rules", []),
-                "any": pl_config.get("any_rules", []),
-            }
-            nsp_content = _build_nsp_content(
-                playlist_name=full_name,
-                rules=rules,
-                sort_field=pl_config.get("sort", "dateadded"),
-                order=pl_config.get("order", "desc"),
-                limit=pl_config.get("limit", 100),
-            )
+            nsp_content = _build_nsp_content(pl_name, description, raw_json_str)
+
             try:
                 _write_nsp_file(filepath, nsp_content)
                 created += 1
@@ -414,13 +487,13 @@ def _generate_playlists():
     if file_errors:
         result["file_errors"] = file_errors
 
-    # --- Trigger Quick Scan ---
-    logger.info("Triggering Navidrome Quick Scan to detect new .nsp files...")
+    # --- Trigger Navidrome Scan ---
+    logger.info("Triggering Navidrome scan via /rest/startScan to detect new .nsp files...")
     scan_ok = trigger_quick_scan()
     result["scan_triggered"] = scan_ok
 
     if not scan_ok:
-        result["error"] = "Failed to trigger Navidrome Quick Scan"
+        result["error"] = "Failed to trigger Navidrome scan"
         return result
 
     # --- Wait for playlists to appear and assign owners ---
@@ -442,7 +515,7 @@ def _generate_playlists():
     if owner_result["not_found"]:
         logger.warning(
             f"{len(owner_result['not_found'])} playlist(s) not found after scan: "
-            f"{owner_result['not_found'][:5]}..."
+            f"{owner_result['not_found'][:5]}"
         )
 
     return result
@@ -481,7 +554,6 @@ def home():
 
     body = '<div style="max-width:800px;">'
 
-    # Status section
     body += "<h3>Configuration Summary</h3>"
     body += f"<p><strong>Output directory:</strong> <code>{_get_output_dir()}</code></p>"
     body += f"<p><strong>Navidrome users found:</strong> {len(users)}</p>"
@@ -493,21 +565,21 @@ def home():
         body += "<h4>Users</h4><ul>"
         for u in users:
             admin_badge = " 👑" if u["is_admin"] else ""
-            body += f"<li>{u['username']}{admin_badge} (id: {u['id'][:8]}...)</li>"
+            body += f"<li>{u['username']}{admin_badge} (id: <code>{u['id'][:8]}...</code>)</li>"
         body += "</ul>"
 
     if playlist_configs:
         body += "<h4>Configured Playlists</h4><ul>"
         for pl in playlist_configs:
+            desc = pl.get("description", "")
+            desc_str = f" — <em>{desc[:50]}{'...' if len(desc) > 50 else ''}</em>" if desc else ""
+            has_raw = "📋 custom JSON" if pl.get("raw_json", "").strip() else "empty"
             body += (
-                f"<li><strong>{pl.get('name', 'Unnamed')}</strong> — "
-                f"sort: {pl.get('sort', 'dateadded')}, "
-                f"order: {pl.get('order', 'desc')}, "
-                f"limit: {pl.get('limit', 100)}</li>"
+                f"<li><strong>{pl.get('name', 'Unnamed')}</strong>"
+                f"{desc_str} ({has_raw})</li>"
             )
         body += "</ul>"
 
-    # Last run results
     if last_run:
         body += "<h3>Last Run Results</h3>"
         body += f"<p><strong>Created:</strong> {last_run.get('created', 0)} .nsp files</p>"
@@ -535,7 +607,6 @@ def home():
                 body += f"<li>{err}</li>"
             body += "</ul>"
 
-    # Manual run button
     body += (
         '<form method="post" action="/plugins/smart_playlist_generator/run" '
         'style="margin-top:1.5rem;">'
@@ -585,31 +656,25 @@ def settings():
             if not name:
                 continue
 
-            try:
-                all_rules = json.loads(request.form.get(f"pl_{i}_all_rules", "[]"))
-            except (json.JSONDecodeError, TypeError):
-                all_rules = []
+            description = request.form.get(f"pl_{i}_description", "").strip()
+            raw_json = request.form.get(f"pl_{i}_raw_json", "")
 
-            try:
-                any_rules = json.loads(request.form.get(f"pl_{i}_any_rules", "[]"))
-            except (json.JSONDecodeError, TypeError):
-                any_rules = []
-
-            sort_field = request.form.get(f"pl_{i}_sort", "dateadded")
-            order = request.form.get(f"pl_{i}_order", "desc")
-
-            try:
-                limit = int(request.form.get(f"pl_{i}_limit", 100))
-            except (ValueError, TypeError):
-                limit = 100
+            # Validate raw_json if provided
+            if raw_json.strip():
+                try:
+                    parsed = json.loads(raw_json)
+                    if not isinstance(parsed, dict):
+                        logger.warning(
+                            f"Playlist '{name}' raw JSON is not a dict, "
+                            f"it will be ignored"
+                        )
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Playlist '{name}' has invalid JSON: {e}")
 
             playlist_configs.append({
                 "name": name,
-                "all_rules": all_rules,
-                "any_rules": any_rules,
-                "sort": sort_field,
-                "order": order,
-                "limit": limit,
+                "description": description,
+                "raw_json": raw_json,
             })
 
         set_setting("playlists", playlist_configs)
@@ -649,9 +714,11 @@ def settings():
     body += "<h3>Playlists</h3>"
     body += (
         '<p>Each playlist below will be created for <strong>every</strong> '
-        "Navidrome user. The playlist name will be suffixed with the username "
-        "(e.g., <em>Recently Played (john)</em>). "
-        "Rules use Navidrome's smart playlist JSON syntax.</p>"
+        "Navidrome user. Each user gets their own copy with themselves as owner. "
+        'The <strong>Raw JSON</strong> field accepts any valid Navidrome smart '
+        'playlist JSON (rules, sort, limit, etc.) — it is written to the .nsp '
+        "file as-is, with <code>name</code>, <code>comment</code> and "
+        "<code>public</code> always overridden.</p>"
     )
 
     body += '<div id="playlists-container">'
@@ -681,11 +748,8 @@ def settings():
         const container = document.getElementById('playlists-container');
         const html = buildPlaylistForm(playlistIndex, {
             name: 'New Playlist',
-            all_rules: [],
-            any_rules: [],
-            sort: 'dateadded',
-            order: 'desc',
-            limit: 100
+            description: '',
+            raw_json: '{\\n  "all": [],\\n  "sort": "dateadded",\\n  "order": "desc",\\n  "limit": 100\\n}'
         });
         container.insertAdjacentHTML('beforeend', html);
         playlistIndex++;
@@ -719,8 +783,6 @@ def settings():
     }
 
     function buildPlaylistForm(idx, pl) {
-        const allRulesStr = JSON.stringify(pl.all_rules || [], null, 2);
-        const anyRulesStr = JSON.stringify(pl.any_rules || [], null, 2);
         return `
         <div class="playlist-block" data-index="${idx}"
              style="border:1px solid #ccc;padding:1rem;margin:1rem 0;border-radius:4px;">
@@ -729,33 +791,19 @@ def settings():
                 <button type="button" class="remove-playlist btn"
                         style="color:red;">Remove</button>
             </div>
-            <label>Name:
+            <label>Playlist name (shown in Navidrome, same for all users):
                 <input type="text" name="pl_${idx}_name"
-                       value="${pl.name || ''}" style="width:60%%;padding:.3rem;">
+                       value="${(pl.name || '').replace(/"/g, '&quot;')}"
+                       style="width:60%%;padding:.3rem;">
             </label><br><br>
-            <label>Sort by:
-                <select name="pl_${idx}_sort">
-                    ${['dateadded','lastplayed','playcount','rating','title','album','artist','year','random']
-                        .map(s => `<option value="${s}" ${s===pl.sort?'selected':''}>${s}</option>`).join('')}
-                </select>
-            </label>
-            <label style="margin-left:1rem;">Order:
-                <select name="pl_${idx}_order">
-                    <option value="desc" ${pl.order==='desc'?'selected':''}>Descending</option>
-                    <option value="asc" ${pl.order==='asc'?'selected':''}>Ascending</option>
-                </select>
-            </label>
-            <label style="margin-left:1rem;">Limit:
-                <input type="number" name="pl_${idx}_limit"
-                       value="${pl.limit || 100}" style="width:80px;padding:.3rem;">
+            <label>Description (optional, becomes the comment field in .nsp):
+                <input type="text" name="pl_${idx}_description"
+                       value="${(pl.description || '').replace(/"/g, '&quot;')}"
+                       style="width:100%%;padding:.3rem;">
             </label><br><br>
-            <label>ALL rules (JSON array):
-                <textarea name="pl_${idx}_all_rules" rows="5"
-                          style="width:100%%;font-family:monospace;padding:.3rem;">${allRulesStr}</textarea>
-            </label><br>
-            <label>ANY rules (JSON array, optional):
-                <textarea name="pl_${idx}_any_rules" rows="3"
-                          style="width:100%%;font-family:monospace;padding:.3rem;">${anyRulesStr}</textarea>
+            <label>Raw JSON (full .nsp content — rules, sort, limit, etc.):
+                <textarea name="pl_${idx}_raw_json" rows="8"
+                          style="width:100%%;font-family:monospace;padding:.3rem;">${pl.raw_json || ''}</textarea>
             </label>
         </div>`;
     }
@@ -770,18 +818,10 @@ def settings():
 
 def _render_playlist_form(idx, pl):
     """Render a single playlist configuration form block."""
-    all_rules_str = json.dumps(pl.get("all_rules", []), indent=2)
-    any_rules_str = json.dumps(pl.get("any_rules", []), indent=2)
-    sort_options = [
-        "dateadded", "lastplayed", "playcount", "rating",
-        "title", "album", "artist", "year", "random",
-    ]
-    sort_select = "".join(
-        f'<option value="{s}" {"selected" if s == pl.get("sort") else ""}>{s}</option>'
-        for s in sort_options
-    )
-    order_desc_selected = "selected" if pl.get("order", "desc") == "desc" else ""
-    order_asc_selected = "selected" if pl.get("order", "desc") == "asc" else ""
+    import html as html_mod
+    name_escaped = html_mod.escape(pl.get("name", ""))
+    desc_escaped = html_mod.escape(pl.get("description", ""))
+    raw_json_escaped = html_mod.escape(pl.get("raw_json", ""))
 
     return f"""
     <div class="playlist-block" data-index="{idx}"
@@ -791,30 +831,17 @@ def _render_playlist_form(idx, pl):
             <button type="button" class="remove-playlist btn"
                     style="color:red;">Remove</button>
         </div>
-        <label>Name:
+        <label>Playlist name (shown in Navidrome, same for all users):
             <input type="text" name="pl_{idx}_name"
-                   value="{pl.get('name', '')}" style="width:60%;padding:.3rem;">
+                   value="{name_escaped}" style="width:60%;padding:.3rem;">
         </label><br><br>
-        <label>Sort by:
-            <select name="pl_{idx}_sort">{sort_select}</select>
-        </label>
-        <label style="margin-left:1rem;">Order:
-            <select name="pl_{idx}_order">
-                <option value="desc" {order_desc_selected}>Descending</option>
-                <option value="asc" {order_asc_selected}>Ascending</option>
-            </select>
-        </label>
-        <label style="margin-left:1rem;">Limit:
-            <input type="number" name="pl_{idx}_limit"
-                   value="{pl.get('limit', 100)}" style="width:80px;padding:.3rem;">
+        <label>Description (optional, becomes the comment field in .nsp):
+            <input type="text" name="pl_{idx}_description"
+                   value="{desc_escaped}" style="width:100%;padding:.3rem;">
         </label><br><br>
-        <label>ALL rules (JSON array):
-            <textarea name="pl_{idx}_all_rules" rows="5"
-                      style="width:100%;font-family:monospace;padding:.3rem;">{all_rules_str}</textarea>
-        </label><br>
-        <label>ANY rules (JSON array, optional):
-            <textarea name="pl_{idx}_any_rules" rows="3"
-                      style="width:100%;font-family:monospace;padding:.3rem;">{any_rules_str}</textarea>
+        <label>Raw JSON (full .nsp content — rules, sort, limit, etc.):
+            <textarea name="pl_{idx}_raw_json" rows="8"
+                      style="width:100%;font-family:monospace;padding:.3rem;">{raw_json_escaped}</textarea>
         </label>
     </div>
     """
