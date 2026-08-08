@@ -10,8 +10,8 @@
       "min_core_version": "2.5.0",
       "changelog": "Fixes",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/OldTyT/AudioMuse-AI-plugins/main/dist/smart_playlist_generator/smart_playlist_generator_0.0.3.zip",
+      "checksum": "db646dcc055b4430a2cfe688fe763a22"
     },
     {
       "version": "0.0.2",
