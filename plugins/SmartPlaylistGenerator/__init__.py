@@ -1,9 +1,7 @@
 import json
 import os
 import glob
-import hashlib
 import requests
-import xml.etree.ElementTree as ET
 
 from flask import Blueprint, request, redirect
 
@@ -15,40 +13,51 @@ bp = Blueprint("smart_playlist_generator", __name__)
 # Navidrome Subsonic API helpers
 # ---------------------------------------------------------------------------
 
-def _navidrome_url():
-    """Get Navidrome base URL from app config."""
-    return (config.NAVIDROME_URL or "").rstrip("/")
+def _get_navidrome_creds():
+    """
+    Get Navidrome connection details.
+    Tries the active server context first (multi-server support),
+    then falls back to the global config (single-server / default).
+    """
+    try:
+        from plugin.api import active_server_id, list_servers
+        server_id = active_server_id()
+        if server_id:
+            for srv in list_servers():
+                if srv.get("server_id") == server_id and srv.get("server_type") == "navidrome":
+                    creds = srv.get("creds") or {}
+                    return {
+                        "url": (creds.get("url") or "").rstrip("/"),
+                        "user": creds.get("user", ""),
+                        "password": creds.get("password", ""),
+                    }
+    except Exception:
+        pass
 
-
-def _navidrome_auth():
-    """Get Subsonic auth params for the configured Navidrome admin account."""
-    user = config.NAVIDROME_USER
-    password = config.NAVIDROME_PASSWORD
-    if not user or not password:
-        return None
+    # Fallback: single-server / default config
     return {
-        "u": user,
-        "p": f"enc:{password.encode('utf-8').hex()}",
-        "v": "1.16.1",
-        "c": "AudioMuse-AI-SmartPlaylistGenerator",
-        "f": "json",
+        "url": (getattr(config, "NAVIDROME_URL", "") or "").rstrip("/"),
+        "user": getattr(config, "NAVIDROME_USER", ""),
+        "password": getattr(config, "NAVIDROME_PASSWORD", ""),
     }
 
 
 def _api_request(endpoint, params=None, method="get"):
     """Make a request to the Navidrome Subsonic API."""
-    auth = _navidrome_auth()
-    if not auth:
+    creds = _get_navidrome_creds()
+    if not creds["url"] or not creds["user"] or not creds["password"]:
         logger.error("Navidrome credentials not configured")
         return None
 
-    base_url = _navidrome_url()
-    if not base_url:
-        logger.error("Navidrome URL not configured")
-        return None
-
-    url = f"{base_url}/rest/{endpoint}.view"
-    all_params = {**auth, **(params or {})}
+    url = f"{creds['url']}/rest/{endpoint}.view"
+    auth_params = {
+        "u": creds["user"],
+        "p": f"enc:{creds['password'].encode('utf-8').hex()}",
+        "v": "1.16.1",
+        "c": "AudioMuse-AI-SmartPlaylistGenerator",
+        "f": "json",
+    }
+    all_params = {**auth_params, **(params or {})}
 
     try:
         r = requests.request(method, url, params=all_params, timeout=30)
@@ -116,7 +125,10 @@ def _write_nsp_file(filepath, nsp_content):
 
 def _get_output_dir():
     """Get the configured output directory for .nsp files."""
-    default_path = os.path.join(config.DATA_DIR or "/data", "smart-playlists")
+    # Use APP_DATA_DIR if available (the correct variable in AudioMuse-AI),
+    # fall back to /data which is the standard Navidrome data volume path.
+    app_data = getattr(config, "APP_DATA_DIR", None) or "/data"
+    default_path = os.path.join(app_data, "smart-playlists")
     return get_setting("output_dir", default_path)
 
 
@@ -227,7 +239,11 @@ def home():
     """Main plugin page showing status and last run results."""
     last_run = get_setting("last_run", None)
     playlist_configs = _get_playlist_configs()
-    users = get_all_users()
+
+    try:
+        users = get_all_users()
+    except Exception:
+        users = []
 
     body = '<div style="max-width:800px;">'
 
@@ -262,6 +278,8 @@ def home():
         body += f"<p><strong>Deleted (stale):</strong> {last_run.get('deleted', 0)} files</p>"
         body += f"<p><strong>Users processed:</strong> {last_run.get('users', 0)}</p>"
         body += f"<p><strong>Time:</strong> {last_run.get('timestamp', 'unknown')}</p>"
+        if last_run.get("error"):
+            body += f"<p><strong>Error:</strong> {last_run['error']}</p>"
 
     # Manual run button
     body += (
@@ -297,7 +315,6 @@ def settings():
             set_setting("output_dir", output_dir)
 
         # Parse playlist configurations from the form
-        # The form sends JSON arrays for each playlist
         playlist_configs = []
         playlist_count = int(request.form.get("playlist_count", 0))
 
@@ -416,7 +433,6 @@ def settings():
             document.querySelector('form').appendChild(countInput);
         }
         countInput.value = blocks.length;
-        // Re-index remaining blocks
         blocks.forEach(function(block, idx) {
             block.dataset.index = idx;
             block.querySelectorAll('[name]').forEach(function(input) {
@@ -434,7 +450,7 @@ def settings():
             <div style="display:flex;justify-content:space-between;align-items:center;">
                 <h4 style="margin:0;">Playlist #${idx + 1}</h4>
                 <button type="button" class="remove-playlist btn"
-                        style="color:red;">✕ Remove</button>
+                        style="color:red;">Remove</button>
             </div>
             <label>Name:
                 <input type="text" name="pl_${idx}_name"
@@ -467,7 +483,6 @@ def settings():
         </div>`;
     }
 
-    // Initialize count
     updatePlaylistCount();
     </script>
     """ % len(playlist_configs)
@@ -497,7 +512,7 @@ def _render_playlist_form(idx, pl):
         <div style="display:flex;justify-content:space-between;align-items:center;">
             <h4 style="margin:0;">Playlist #{idx + 1}</h4>
             <button type="button" class="remove-playlist btn"
-                    style="color:red;">✕ Remove</button>
+                    style="color:red;">Remove</button>
         </div>
         <label>Name:
             <input type="text" name="pl_{idx}_name"
