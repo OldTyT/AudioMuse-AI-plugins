@@ -8,14 +8,8 @@ import requests
 import numpy as np
 from flask import Blueprint, request, redirect, url_for, flash
 
-from rq import Queue
-from redis import Redis
-from flask import flash
-from database import save_task_status
-
-import config
 from plugin.api import (
-    get_db, get_setting, set_setting, render_page, manage_plugins_url, table
+    get_db, get_setting, set_setting, render_page, manage_plugins_url, table, enqueue
 )
 
 logger = logging.getLogger(__name__)
@@ -421,7 +415,7 @@ def create_private_playlist(username, canonical_ids):
         for pl in matching_playlists:
             if pl['date_str'] == today_str:
                 today_playlist_id = pl['id']
-                logger.info(f"[create_private_playlist] Today's playlist already exists: {pl['name']}")
+                logger.info(f"[create_private_playlist] Today's playlist exists: {pl['name']}")
                 break
         
         # ============================================================
@@ -570,86 +564,70 @@ def rotate_user_playlists(username, base_playlist_name, current_date_str):
         logger.exception(f"Failed to rotate playlists for user {username}: {e}")
 
 def run_batch_task():
-    """Main entry point executed by the AudioMuse-AI Cron scheduler or RQ worker."""
+    """Main entry point executed by the AudioMuse-AI Cron scheduler or worker."""
     
-    try:
-        from flask_app import app
-        ctx = app.app_context()
-        ctx.push()
-    except Exception as e:
-        logger.error(f"Failed to push app context in RQ worker: {e}")
-        ctx = None
-
-    try:
-        logger.info("=== Starting Batch Sonic Fingerprint via ND_EXTAUTH ===")
-        users = get_all_users()
+    logger.info("=== Starting Batch Sonic Fingerprint via ND_EXTAUTH ===")
+    users = get_all_users()
+    
+    if not users:
+        logger.warning("No users fetched. Aborting.")
+        return
         
-        if not users:
-            logger.warning("No users fetched. Aborting.")
-            return
+    num_neighbors = get_s('num_neighbors')
+    max_tracks = get_s('max_tracks')
+    
+    for user in users:
+        try:
+            logger.info(f"Processing user: {user}")
             
-        num_neighbors = get_s('num_neighbors')
-        max_tracks = get_s('max_tracks')
-        
-        for user in users:
-            try:
-                logger.info(f"Processing user: {user}")
-                
-                # STEP 1: Get top tracks
-                top_tracks = get_user_top_tracks(user)
-                if not top_tracks:
-                    logger.warning(f"No top tracks found for user {user}. Skipping.")
-                    continue
-                logger.info(f"[{user}] Found {len(top_tracks)} top tracks")
-                
-                # STEP 2: Compute fingerprint vector
-                result = compute_fingerprint_vector(user, top_tracks)
-                if not result:
-                    logger.warning(f"Could not compute fingerprint vector for user {user}. Skipping.")
-                    continue
-                logger.info(f"[{user}] Computed fingerprint vector successfully")
-                
-                average_vector, seed_ids = result
-                logger.info(f"[{user}] Seed tracks: {len(seed_ids)}")
-                
-                # STEP 3: Find similar tracks
-                similar_tracks = get_similar_tracks(average_vector, num_neighbors)
-                similar_ids = [t['item_id'] for t in similar_tracks]
-                logger.info(f"[{user}] Found {len(similar_tracks)} similar tracks")
-                
-                # STEP 4: Combine seeds and neighbors
-                final_ids = []
-                seen = set()
-                for cid in seed_ids + similar_ids:
-                    if cid not in seen:
-                        final_ids.append(cid)
-                        seen.add(cid)
-                logger.info(f"[{user}] Combined unique tracks: {len(final_ids)}")
-                
-                # STEP 5: Truncate
-                final_ids = final_ids[:max_tracks]
-                logger.info(f"[{user}] Final track count after truncation: {len(final_ids)}")
-                
-                if not final_ids:
-                    logger.warning(f"[{user}] No final tracks generated. Skipping playlist creation.")
-                    continue
-                
-                # STEP 6: Create playlist
-                logger.info(f"[{user}] Calling create_private_playlist with {len(final_ids)} tracks...")
-                create_private_playlist(user, final_ids)
-                logger.info(f"[{user}] create_private_playlist completed successfully")
-                
-            except Exception as e:
-                logger.exception(f"Fatal error processing user {user}: {e}")
-                
-        logger.info("=== Batch Sonic Fingerprint completed ===")
-        
-    finally:
-        if ctx is not None:
-            try:
-                ctx.pop()
-            except Exception:
-                pass
+            # STEP 1: Get top tracks
+            top_tracks = get_user_top_tracks(user)
+            if not top_tracks:
+                logger.warning(f"No top tracks found for user {user}. Skipping.")
+                continue
+            logger.info(f"[{user}] Found {len(top_tracks)} top tracks")
+            
+            # STEP 2: Compute fingerprint vector
+            result = compute_fingerprint_vector(user, top_tracks)
+            if not result:
+                logger.warning(f"Could not compute fingerprint vector for user {user}. Skipping.")
+                continue
+            logger.info(f"[{user}] Computed fingerprint vector successfully")
+            
+            average_vector, seed_ids = result
+            logger.info(f"[{user}] Seed tracks: {len(seed_ids)}")
+            
+            # STEP 3: Find similar tracks
+            similar_tracks = get_similar_tracks(average_vector, num_neighbors)
+            similar_ids = [t['item_id'] for t in similar_tracks]
+            logger.info(f"[{user}] Found {len(similar_tracks)} similar tracks")
+            
+            # STEP 4: Combine seeds and neighbors
+            final_ids = []
+            seen = set()
+            for cid in seed_ids + similar_ids:
+                if cid not in seen:
+                    final_ids.append(cid)
+                    seen.add(cid)
+            logger.info(f"[{user}] Combined unique tracks: {len(final_ids)}")
+            
+            # STEP 5: Truncate
+            final_ids = final_ids[:max_tracks]
+            logger.info(f"[{user}] Final track count after truncation: {len(final_ids)}")
+            
+            if not final_ids:
+                logger.warning(f"[{user}] No final tracks generated. Skipping playlist creation.")
+                continue
+            
+            # STEP 6: Create playlist
+            logger.info(f"[{user}] Calling create_private_playlist with {len(final_ids)} tracks...")
+            create_private_playlist(user, final_ids)
+            logger.info(f"[{user}] create_private_playlist completed successfully")
+            
+        except Exception as e:
+            logger.exception(f"Fatal error processing user {user}: {e}")
+            
+    logger.info("=== Batch Sonic Fingerprint completed ===")
 
 # --- UI ROUTES ---
 
@@ -707,21 +685,8 @@ def run_now():
     result_type = "success"
     
     try:
-        # Safely get Redis URL from Flask app config, fallback to Docker default
-        redis_url = config.REDIS_URL
-        redis_conn = Redis.from_url(redis_url)
-        
-        # Use 'high' queue for critical/coordinator tasks
-        q = Queue('high', connection=redis_conn)
-        
-        # Pass the function object directly to RQ
-        job = q.enqueue(run_batch_task, job_timeout='2h')
-        
-        # Initialize task status so it appears in the UI task panel immediately
-        save_task_status(
-            job.id, 'sonic_fingerprint', 'started', progress=0,
-            details={"message": "Manual batch run triggered by admin..."}
-        )
+        # Enqueue using the new DB-based queue API (v3.2.0+)
+        job = enqueue(run_batch_task, queue='high')
         
         result_message = (
             f"Task enqueued successfully.<br>"
