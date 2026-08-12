@@ -10,8 +10,8 @@
       "min_core_version": "3.6.0",
       "changelog": "Fix for queue in db",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/OldTyT/AudioMuse-AI-plugins/main/dist/batch_sonic_fp/batch_sonic_fp_0.0.14.zip",
+      "checksum": "40aee9bc76c682219f12312b44adcfab"
     },
     {
       "version": "0.0.13",
